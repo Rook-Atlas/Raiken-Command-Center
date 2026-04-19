@@ -1239,15 +1239,20 @@ class RaikenWindow:
         return ""
 
     def _copy_last_assistant(self):
-        self._copy_to_clipboard(self._last_message("assistant").strip())
+        # Raiken emits his turns with role "raiken" (not "assistant") per the
+        # rename in round A of the UI refactor. Searching "assistant" always
+        # missed and silently copied an empty string.
+        self._copy_to_clipboard(self._last_message("raiken").strip())
 
     def _copy_last_user(self):
         self._copy_to_clipboard(self._last_message("user").strip())
 
     def _copy_all_chat(self):
-        lines = []
-        for m in self._messages:
-            lines.append(f"[{m['role'].upper()}] {m['text'].strip()}")
+        # Snapshot the list before iterating — the asyncio thread appends to
+        # self._messages concurrently, so iterating the live list could skip
+        # entries or blow up under rare timing.
+        msgs = list(self._messages)
+        lines = [f"[{m['role'].upper()}] {m['text'].strip()}" for m in msgs]
         self._copy_to_clipboard("\n\n".join(lines))
 
     def _show_chat_menu(self, event):
