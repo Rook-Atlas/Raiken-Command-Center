@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Logs & runtime state
+logs/
+*.log
+
+# Worker runtime state (session IDs, ephemeral data — regenerated at startup)
+workers/registry.json
+workers/window_state.json
+workers/ollama_config.json
+
+# Per-user UI state (window geometry, etc.)
+ui_state.json
+
+# Secrets & credentials
+.env
+.env.*
+*.env
+credentials.json
+token.json
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.*
+config.secret.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Large binary assets (commit intentionally if needed)
+# *.png
+# *.ico
