@@ -13,6 +13,7 @@ Stop: tray icon -> Quit, or Ctrl+C
 """
 import asyncio
 import collections
+from datetime import datetime
 import json
 import os
 import queue
@@ -657,17 +658,46 @@ DISPATCHER_LOG_PATH = _LOG_DIR / "dispatcher.log"
 
 
 class DispatcherLog:
-    """Thread-safe ring buffer + JSONL file for Dispatcher half activity."""
+    """Thread-safe ring buffer + JSONL file for Dispatcher half activity.
+
+    RCC 2.0: on boot, reloads the tail of the on-disk log into the ring buffer
+    so Dispatcher continuity survives restarts. The Raiken.run() boot sequence
+    also calls build_boot_continuity_block() on startup to inject a compact
+    summary into Dispatcher's system prompt — she sees what she was mid-doing
+    before RCC last closed, rather than starting cold every launch.
+    """
 
     def __init__(self, path: Path, max_entries: int = 500):
         self._path = path
         self._lock = threading.Lock()
         self._buf: collections.deque[dict] = collections.deque(maxlen=max_entries)
+        # Replay the tail of the on-disk log into the ring buffer so restart
+        # doesn't wipe continuity. Read up to max_entries from the end of the
+        # file; tolerate malformed lines (partial last entry, etc.) silently.
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8", errors="replace") as rf:
+                    tail = collections.deque(rf, maxlen=max_entries)
+                for raw in tail:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        self._buf.append(json.loads(raw))
+                    except Exception:
+                        continue
+                if self._buf:
+                    print(
+                        f"[dispatcher-log] restored {len(self._buf)} entries from {path}",
+                        flush=True,
+                    )
+        except Exception as e:
+            print(f"[dispatcher-log] replay failed: {e}", flush=True)
         self._fp = None
         try:
             self._fp = open(path, "a", encoding="utf-8", buffering=1)
         except Exception as e:
-            print(f"[dispatcher-log] could not open {path}: {e}", flush=True)
+            print(f"[dispatcher-log] could not open {path} for append: {e}", flush=True)
 
     def record(self, kind: str, **fields):
         entry = {"ts": time.time(), "kind": kind, **fields}
@@ -687,6 +717,59 @@ class DispatcherLog:
                 return list(self._buf)
             # deque doesn't support negative indexing slice; take from right.
             return list(self._buf)[-limit:]
+
+    def build_boot_continuity_block(self, limit: int = 30, max_chars: int = 2500) -> str:
+        """Format recent entries into a compact text block for injection into
+        Dispatcher's system prompt at boot. Gives her a picture of what she
+        was mid-doing before the last restart so she doesn't start cold.
+
+        Returns empty string if the log is empty (fresh install or cleared).
+        Cap at max_chars to keep the boot prompt lean; prefer recency.
+        """
+        entries = self.recent(limit=limit)
+        if not entries:
+            return ""
+        lines = []
+        # Walk oldest-to-newest so the most-recent activity sits at the tail.
+        for e in entries:
+            ts = e.get("ts", 0)
+            when = ""
+            try:
+                when = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            except Exception:
+                pass
+            kind = e.get("kind", "?")
+            # Compact format — one line per entry.
+            if kind == "message_in":
+                snippet = (e.get("text") or "").strip().replace("\n", " ")[:100]
+                lines.append(f"  [{when}] heard: {snippet}")
+            elif kind == "authorize":
+                t = (e.get("task") or "").strip().replace("\n", " ")[:100]
+                lines.append(f"  [{when}] authorized: {t}")
+            elif kind == "tool_call":
+                worker = e.get("worker", "?")
+                task = (e.get("task") or "").strip().replace("\n", " ")[:80]
+                lines.append(f"  [{when}] dispatched {worker}: {task}")
+            elif kind == "decision":
+                reason = (e.get("reason") or e.get("text") or "no-op").strip()[:80]
+                lines.append(f"  [{when}] decision: {reason}")
+            elif kind == "error":
+                err = (e.get("error") or "").strip()[:80]
+                lines.append(f"  [{when}] error: {err}")
+            elif kind == "done":
+                dispatched = e.get("dispatched")
+                lines.append(f"  [{when}] turn done (dispatched={dispatched})")
+            else:
+                lines.append(f"  [{when}] {kind}")
+        # Take from the tail if we exceed max_chars — most-recent wins.
+        out = "\n".join(lines)
+        if len(out) > max_chars:
+            # Drop leading lines until we fit.
+            while lines and len("\n".join(lines)) > max_chars:
+                lines.pop(0)
+            out = "\n".join(lines)
+            out = "  [...earlier activity truncated...]\n" + out
+        return out
 
 
 # =============================================================================
@@ -2148,8 +2231,26 @@ class Raiken:
         # files are available. Without this each SDK starts cold every launch
         # and acts like it has no idea what project it's in.
         bootstrap = _build_bootstrap_context()
+        # Dispatcher gets a compact "recent activity" continuity block so she
+        # knows what she was doing before the last restart. Pulled from the
+        # on-disk dispatcher log (which replays its tail at DispatcherLog
+        # init). Empty on fresh installs / cleared logs. RCC 2.0 Phase 2.
+        try:
+            continuity = DISPATCHER_LOG.build_boot_continuity_block(limit=30, max_chars=2500)
+        except Exception as e:
+            print(f"[boot] continuity block failed: {e}", flush=True)
+            continuity = ""
+        continuity_block = ""
+        if continuity:
+            continuity_block = (
+                "\n\n--- DISPATCHER CONTINUITY (recent activity from prior session, "
+                "oldest-first; use this to pick up where you left off, but treat the "
+                "CURRENT user message as the live priority) ---\n"
+                + continuity
+                + "\n--- END CONTINUITY ---\n\n"
+            )
         speaker_system = bootstrap + SYSTEM_PROMPT
-        dispatcher_system = bootstrap + DISPATCHER_SYSTEM_PROMPT
+        dispatcher_system = bootstrap + continuity_block + DISPATCHER_SYSTEM_PROMPT
 
         speaker_options = ClaudeAgentOptions(
             system_prompt=speaker_system,
