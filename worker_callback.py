@@ -11,6 +11,8 @@ Endpoints:
   POST /status            — push a short phase label ("researching", etc.)
   POST /dispatch_sub      — parent wants to spawn a sub-agent
   POST /escalate          — parent asks for permission to spawn Opus-tier
+  POST /ask_raiken        — parent asks Raiken Agent for advice (depth-1 cap)
+  POST /compact_memory    — parent logs a memory-compaction event
 
 Every request must carry X-Raiken-Token matching the server token or is
 rejected 401. Binding to 127.0.0.1 is a belt-and-suspenders defense on top
@@ -32,6 +34,8 @@ class _Handler(BaseHTTPRequestHandler):
     on_status: Callable[[dict], dict] | None = None
     on_dispatch_sub: Callable[[dict], dict] | None = None
     on_escalate: Callable[[dict], dict] | None = None
+    on_ask_raiken: Callable[[dict], dict] | None = None
+    on_compact_memory: Callable[[dict], dict] | None = None
 
     def log_message(self, format, *args):   # noqa: A003
         # Silence the default stderr access log — it fires on every worker
@@ -80,6 +84,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, self.on_dispatch_sub(payload))
             if self.path == "/escalate" and self.on_escalate is not None:
                 return self._send_json(200, self.on_escalate(payload))
+            if self.path == "/ask_raiken" and self.on_ask_raiken is not None:
+                return self._send_json(200, self.on_ask_raiken(payload))
+            if self.path == "/compact_memory" and self.on_compact_memory is not None:
+                return self._send_json(200, self.on_compact_memory(payload))
         except Exception as e:
             return self._send_json(
                 500, {"error": f"{type(e).__name__}: {e}"},
@@ -114,10 +122,14 @@ class WorkerCallbackServer:
         on_status: Callable[[dict], dict],
         on_dispatch_sub: Callable[[dict], dict],
         on_escalate: Callable[[dict], dict],
+        on_ask_raiken: Callable[[dict], dict] | None = None,
+        on_compact_memory: Callable[[dict], dict] | None = None,
     ):
         self.on_status = on_status
         self.on_dispatch_sub = on_dispatch_sub
         self.on_escalate = on_escalate
+        self.on_ask_raiken = on_ask_raiken
+        self.on_compact_memory = on_compact_memory
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.url: str = ""
@@ -138,6 +150,8 @@ class WorkerCallbackServer:
                 "on_status": staticmethod(self.on_status),
                 "on_dispatch_sub": staticmethod(self.on_dispatch_sub),
                 "on_escalate": staticmethod(self.on_escalate),
+                "on_ask_raiken": staticmethod(self.on_ask_raiken) if self.on_ask_raiken else None,
+                "on_compact_memory": staticmethod(self.on_compact_memory) if self.on_compact_memory else None,
             },
         )
         self._server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)

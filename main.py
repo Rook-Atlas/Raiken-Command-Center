@@ -949,30 +949,28 @@ async def dispatch_worker_tool(args):
         except Exception as ex:
             print(f"[notify] router raised: {ex}", flush=True)
 
-        # Auto-fire a worker-return narration turn over TTS. We skip it only
-        # when Rook is clearly away (15+ min idle) — at that point the phone
-        # push is what will reach him; TTS to an empty room is waste. If he's
-        # active OR idle (nearby), narrate.
+        # Phase 4: aggregate worker returns. Instead of immediately firing
+        # a Raiken narration turn for each completion, schedule a debounced
+        # wake (3-sec window, 12-sec cap). If more workers complete inside
+        # that window, the wake narrates all of them together — no back-to-
+        # back interruptions.
         #
-        # PTT gate: if Rook is currently holding push-to-talk, don't fire now.
-        # The result is already in _pending_worker_results, so it will surface
-        # either in his [worker-updates] preamble when he speaks, or via
-        # _flush_deferred_wake() the moment he releases PTT without speaking.
-        if not _APP_REF.raiken.turn_in_progress:
-            presence = _APP_REF.get_effective_presence()
-            if presence != "away":
-                if _APP_REF.raiken.recording:
-                    print(f"[worker-return] PTT held — deferring auto-wake for '{name}'", flush=True)
-                else:
-                    loop = _APP_REF.raiken.loop
-                    if loop is not None:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                _APP_REF.raiken.submit("[WORKER-RETURN]"),
-                                loop,
-                            )
-                        except Exception as ex:
-                            print(f"[worker-return] auto-fire failed: {ex}", flush=True)
+        # Gates that still apply:
+        # - Mid-turn: schedule_worker_return_wake is a no-op if Raiken is
+        #   currently generating; submit's finally will pick up pending
+        #   results.
+        # - Away: also a no-op inside schedule_worker_return_wake — phone
+        #   push will handle delivery when those backends land.
+        # - PTT held: schedule_worker_return_wake runs now, but
+        #   _fire_worker_return_wake re-checks `recording` via the presence /
+        #   turn-in-progress gates inside it.
+        if _APP_REF.raiken.recording:
+            print(f"[worker-return] PTT held — deferring auto-wake for '{name}'", flush=True)
+        else:
+            try:
+                _APP_REF.schedule_worker_return_wake()
+            except Exception as ex:
+                print(f"[worker-return] schedule failed: {ex}", flush=True)
 
     asyncio.create_task(_background_run())
 
@@ -1302,9 +1300,9 @@ MEMORY_MCP_SERVER = create_sdk_mcp_server(
     "questions about your state, or vault operations. Task should be a short "
     "summary of what the worker needs to do — Dispatcher will pick the agent "
     "and expand the task text. Reason is for the audit log so Rook can see "
-    "why you authorized. The call returns immediately; Dispatcher runs in the "
-    "background and the worker result will land in a later [worker-updates] "
-    "preamble.",
+    "why you authorized. Returns immediately; Dispatcher batches rapid "
+    "back-to-back authorizations (2-sec window) so Rook rambling through "
+    "multiple related asks fires as one coherent dispatch round.",
     {"task": str, "reason": str},
 )
 async def request_dispatch_tool(args):
@@ -1325,11 +1323,14 @@ async def request_dispatch_tool(args):
         )
     except Exception:
         pass
-    # Fire Dispatcher turn in background — Speaker's turn shouldn't block on it.
+    # Queue for debounced flush. If Rook rambles through multiple related
+    # asks, Speaker makes multiple request_dispatch calls in quick
+    # succession; we accumulate and fire one Dispatcher turn with all tasks
+    # after 2 sec of quiet. Single-task case still feels immediate enough.
     try:
-        asyncio.create_task(raiken._execute_dispatcher_turn(task))
+        _APP_REF.enqueue_authorization(task, reason)
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"error scheduling dispatcher turn: {e}"}]}
+        return {"content": [{"type": "text", "text": f"error queuing authorization: {e}"}]}
     preview = task[:80] + ("…" if len(task) > 80 else "")
     return {"content": [{"type": "text", "text": f"authorized: {preview}"}]}
 
@@ -2331,6 +2332,20 @@ class RaikenApp:
         # worker (two `claude --resume <id>` subprocesses would race the session).
         self._worker_locks: dict[str, asyncio.Lock] = {}
 
+        # Phase 4: dispatch-authorization debounce. request_dispatch calls pile
+        # up here instead of firing Dispatcher one-per-call; a 2-sec timer
+        # flushes the whole batch so rapid follow-up asks bundle coherently.
+        self._pending_authorizations: list[dict] = []
+        self._authorization_lock = threading.Lock()
+        self._authorization_timer_handle = None  # asyncio.TimerHandle | None
+
+        # Phase 4: worker-return aggregation window. Every worker completion
+        # resets a 3-sec timer (capped at 12s absolute); when it fires the
+        # auto-wake narrates all accumulated results in one Raiken turn.
+        self._wake_timer_handle = None  # asyncio.TimerHandle | None
+        self._wake_window_first_ts: float | None = None
+        self._wake_timer_lock = threading.Lock()
+
         # Full worker transcripts keyed by run_id — the Log tab + click-to-open
         # flow both read from here. Counter advances per dispatch. Capped so
         # long sessions don't grow this dict without bound; older transcripts
@@ -2388,6 +2403,8 @@ class RaikenApp:
                 on_status=self.handle_worker_status_cb,
                 on_dispatch_sub=self.handle_worker_dispatch_sub_cb,
                 on_escalate=self.handle_worker_escalate_cb,
+                on_ask_raiken=self.handle_worker_ask_raiken_cb,
+                on_compact_memory=self.handle_worker_compact_memory_cb,
             )
             self._callback_url, self._callback_token = self._worker_callback_server.start()
             print(f"[raiken] worker callback at {self._callback_url}", flush=True)
@@ -2619,6 +2636,148 @@ class RaikenApp:
                 "completed_at": time.time(),
             })
 
+    # --- Phase 4: dispatch-authorization debounce ---------------------------
+    # request_dispatch accumulates tasks for 2 seconds before firing one
+    # Dispatcher turn with all of them. If Rook rambles through multiple
+    # related asks ("fix the UI lag, also the tab sizing is bad, also the
+    # vault button is laggy"), Speaker fires request_dispatch multiple times
+    # in quick succession. Without this, we'd dispatch three workers who
+    # might step on each other. With this, the Dispatcher sees all three at
+    # once and can bundle them into one well-scoped task.
+    AUTHORIZATION_DEBOUNCE_SEC = 2.0
+
+    def enqueue_authorization(self, task: str, reason: str):
+        """Queue a task authorization and reset the flush timer. Idempotent;
+        safe to call from any asyncio context."""
+        loop = self.raiken.loop or self.asyncio_loop
+        with self._authorization_lock:
+            self._pending_authorizations.append({
+                "task": task, "reason": reason, "ts": time.time(),
+            })
+            # Cancel any existing timer and reset.
+            if self._authorization_timer_handle is not None:
+                try:
+                    self._authorization_timer_handle.cancel()
+                except Exception:
+                    pass
+                self._authorization_timer_handle = None
+            if loop is not None:
+                try:
+                    self._authorization_timer_handle = loop.call_later(
+                        self.AUTHORIZATION_DEBOUNCE_SEC,
+                        self._flush_authorizations,
+                    )
+                except Exception:
+                    # Fallback: fire immediately if we can't schedule.
+                    self._flush_authorizations()
+
+    def _flush_authorizations(self):
+        """Drain buffered authorizations and fire one Dispatcher turn with
+        the bundled task. Runs on the asyncio loop (scheduled via call_later)."""
+        with self._authorization_lock:
+            batch = list(self._pending_authorizations)
+            self._pending_authorizations.clear()
+            self._authorization_timer_handle = None
+        if not batch:
+            return
+        if len(batch) == 1:
+            bundled = batch[0]["task"]
+        else:
+            # Bundle multiple tasks into one coherent Dispatcher prompt.
+            lines = [
+                f"Rook authorized {len(batch)} related tasks in quick succession. "
+                f"Evaluate together; bundle into one dispatch if they cohere "
+                f"(e.g. all UI work -> one Shadowling task with all fixes), "
+                f"or separate if they're genuinely unrelated. Do not dispatch "
+                f"two named agents to overlapping work.",
+                "",
+            ]
+            for i, b in enumerate(batch, 1):
+                rs = f" (reason: {b['reason']})" if b.get("reason") else ""
+                lines.append(f"{i}. {b['task']}{rs}")
+            bundled = "\n".join(lines)
+        try:
+            DISPATCHER_LOG.record(
+                "authorize_flush",
+                count=len(batch),
+                preview=(bundled[:300] + ("…" if len(bundled) > 300 else "")),
+            )
+        except Exception:
+            pass
+        if self.raiken is None or self.raiken.dispatcher_client is None:
+            return
+        try:
+            asyncio.create_task(self.raiken._execute_dispatcher_turn(bundled))
+        except Exception as e:
+            print(f"[authorizations] flush failed: {e}", flush=True)
+
+    # --- Phase 4: worker-return aggregation window --------------------------
+    # When workers finish close together, aggregating their narrations into
+    # one Speaker turn is much nicer than three back-to-back interruptions.
+    # record_worker_result already appends to _pending_worker_results; this
+    # layer debounces the auto-wake so the wake fires 3 sec after the LAST
+    # return — bundling everything that arrived inside the window.
+    WAKE_AGGREGATION_SEC = 3.0
+
+    def schedule_worker_return_wake(self):
+        """Called from a worker's background-run when it completes. Resets
+        a 3-sec timer; when it elapses, fires one `[WORKER-RETURN]` synthetic
+        turn so Raiken narrates all pending results together. Additional
+        results that arrive inside the window extend it (up to a hard cap
+        of 12 sec so we don't defer forever on a hot dispatch burst)."""
+        loop = self.raiken.loop or self.asyncio_loop
+        if loop is None:
+            return
+        now = time.time()
+        with self._wake_timer_lock:
+            # Hard cap: if the window has already been extended past 12s,
+            # don't keep pushing it. Fire the pending wake at the cap.
+            first_ts = self._wake_window_first_ts
+            max_window = 12.0
+            if first_ts and (now - first_ts) >= max_window:
+                # Let the existing timer fire as scheduled; don't extend.
+                return
+            if first_ts is None:
+                self._wake_window_first_ts = now
+            if self._wake_timer_handle is not None:
+                try:
+                    self._wake_timer_handle.cancel()
+                except Exception:
+                    pass
+                self._wake_timer_handle = None
+            try:
+                self._wake_timer_handle = loop.call_later(
+                    self.WAKE_AGGREGATION_SEC, self._fire_worker_return_wake,
+                )
+            except Exception:
+                # If scheduling fails, fall back to immediate fire.
+                self._fire_worker_return_wake()
+
+    def _fire_worker_return_wake(self):
+        """Timer callback — fires [WORKER-RETURN] if conditions are right."""
+        with self._wake_timer_lock:
+            self._wake_timer_handle = None
+            self._wake_window_first_ts = None
+        if self.raiken is None:
+            return
+        # Skip if Raiken's mid-turn; submit's finally will pick up pending
+        # results on the next natural boundary.
+        if self.raiken.turn_in_progress:
+            return
+        presence = self.get_effective_presence()
+        if presence == "away":
+            # Silent — phone push handles remote delivery when wired.
+            return
+        loop = self.raiken.loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.raiken.submit("[WORKER-RETURN]"), loop,
+            )
+        except Exception as e:
+            print(f"[wake] aggregated fire failed: {e}", flush=True)
+
     def drain_pending_worker_results(self) -> list[dict]:
         """Pop every queued worker result (called by Raiken at turn start)."""
         with self._pending_worker_results_lock:
@@ -2836,6 +2995,129 @@ class RaikenApp:
             print(f"[sub-agent] post-dispatch UI update failed: {ex}", flush=True)
 
         return result
+
+    # --- ask-raiken: worker -> Raiken Agent advisor callback ----------------
+    def handle_worker_ask_raiken_cb(self, payload: dict) -> dict:
+        """HTTP /ask_raiken handler: a stuck worker wants guidance from Raiken
+        Agent. We dispatch Raiken Agent synchronously with a wrapped prompt
+        that instructs him to return ADVICE (not take over the task), then
+        return his response to the caller. Blocks this HTTP thread until
+        Raiken Agent finishes.
+
+        Depth-1 cap: Raiken Agent himself cannot call ask-raiken. This
+        prevents recursive escalation — he's the ceiling."""
+        parent = str(payload.get("parent") or "").strip()
+        question = str(payload.get("question") or "").strip()
+        if not parent or not question:
+            return {"ok": False, "error": "parent + question required"}
+        if parent == "Raiken Agent":
+            return {
+                "ok": False,
+                "error": "depth-1 cap: Raiken Agent cannot ask-raiken recursively",
+            }
+        loop = self.raiken.loop or self.asyncio_loop
+        if loop is None:
+            return {"ok": False, "error": "asyncio loop not running"}
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._run_raiken_advisor(parent, question),
+                loop,
+            )
+            result = fut.result()
+        except Exception as e:
+            return {"ok": False, "error": f"ask-raiken crashed: {type(e).__name__}: {e}"}
+        return {
+            "ok": bool(result.get("success")),
+            "advice": result.get("output", "") or "",
+            "error": result.get("error", "") or "",
+            "elapsed": float(result.get("elapsed", 0.0) or 0.0),
+        }
+
+    async def _run_raiken_advisor(self, asker: str, question: str) -> dict:
+        """Dispatch Raiken Agent with a prompt that frames him as an advisor,
+        not a replacement for the caller. He returns guidance; the caller
+        continues owning the task."""
+        wrapped = (
+            f"[ADVISORY REQUEST from worker {asker!r}]\n"
+            "You are being consulted as an advisor. The calling worker is in\n"
+            "the middle of a task and needs guidance. Return ADVICE, not a\n"
+            "task handoff — the caller continues owning the task, applying\n"
+            "your guidance as they see fit.\n"
+            "\n"
+            f"Question from {asker}:\n"
+            f"{question}\n"
+            "\n"
+            "Respond with a concise, actionable reply (ideally 1-3 paragraphs).\n"
+            "If the caller's approach is flat-out wrong, say so and suggest a\n"
+            "better one. If the approach is sound but they're stuck on a detail,\n"
+            "give them the unblock. Do not propose to take over.\n"
+        )
+        self.register_active_worker("Raiken Agent", f"advising {asker}")
+        self.raiken._emit_dispatch_badge(
+            name="Raiken Agent", tier_label=f"Opus · advising {asker}",
+        )
+        print(f"[ask-raiken] asker={asker!r} question={question[:80]!r}", flush=True)
+        try:
+            result = await run_worker(
+                "Raiken Agent", wrapped,
+                model="opus",  # always opus for advisor — force_tier handles this too
+                callback_env=self.worker_callback_env("Raiken Agent"),
+            )
+        except Exception as e:
+            result = {
+                "success": False,
+                "error": f"advisor crashed: {type(e).__name__}: {e}",
+                "output": "",
+                "elapsed": 0.0,
+            }
+        finally:
+            self.unregister_active_worker("Raiken Agent")
+        try:
+            run_id = self.store_worker_result(
+                "Raiken Agent",
+                f"[advisory for {asker}] {question}",
+                result,
+                origin="ask-raiken",
+            )
+            self.raiken._emit_worker_done(
+                name="Raiken Agent",
+                success=bool(result.get("success")),
+                elapsed=float(result.get("elapsed", 0.0) or 0.0),
+                run_id=run_id,
+            )
+        except Exception as ex:
+            print(f"[ask-raiken] post-advice UI update failed: {ex}", flush=True)
+        return result
+
+    # --- compact-memory: worker audit log ----------------------------------
+    def handle_worker_compact_memory_cb(self, payload: dict) -> dict:
+        """HTTP /compact_memory handler: a worker just wrote learnings to a
+        memory file and cleared its context. We append an audit entry to
+        workers/memory_compaction_log.jsonl so Rook can trace memory changes."""
+        parent = str(payload.get("parent") or "").strip()
+        file_name = str(payload.get("file") or "").strip()
+        summary = str(payload.get("summary") or "").strip()
+        if not parent or not file_name:
+            return {"ok": False, "error": "parent + file required"}
+        try:
+            log_path = APP_REPO_DIR / "workers" / "memory_compaction_log.jsonl"
+            log_path.parent.mkdir(exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps({
+                    "ts": time.time(),
+                    "agent": parent,
+                    "memory_file": file_name,
+                    "summary": summary,
+                    "source": "worker_tools",
+                }) + "\n")
+        except Exception as e:
+            return {"ok": False, "error": f"log write failed: {e}"}
+        print(
+            f"[compact-memory] {parent} -> {file_name}"
+            + (f" ({summary[:80]})" if summary else ""),
+            flush=True,
+        )
+        return {"ok": True}
 
     def context_usage_snapshot(self) -> dict | None:
         with self.raiken._usage_lock:
