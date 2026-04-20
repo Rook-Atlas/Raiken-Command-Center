@@ -236,16 +236,21 @@ def seed_named_workers():
     # Project-scoped agents — cwd narrowed to the specific project so their
     # attention stays on that codebase. They still get the global permission
     # preamble for cross-directory work when needed.
+    #
+    # IMPORTANT: we no longer pin session_id= to Rook's personal Claude Code
+    # sessions. That caused collisions when Rook ran `claude` directly in the
+    # project folder while RCC also tried to --resume the same session —
+    # Claude Code serializes per-session, and the two ends fought. These
+    # agents now get fresh UUIDs on first seed so they have their OWN
+    # session transcripts separate from Rook's personal ones.
     register_named_worker(
         "Marl",
-        session_id="d048154a-86eb-417f-946e-db7598bc8483",
         cwd=r"C:\Users\Rook\Documents\Claude\Projects\Royal Hearts",
         backend="claude",
         preferred_tier="opus",
     )
     register_named_worker(
         "CMMC Wizard",
-        session_id="a448e86b-bf45-42e1-92ab-36d9bb7cd27e",
         cwd=r"C:\Users\Rook\Documents\Claude\Projects\APP CMMC Assessment",
         backend="claude",
         preferred_tier="opus",
