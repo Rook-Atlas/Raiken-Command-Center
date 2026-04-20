@@ -663,8 +663,9 @@ class DispatcherLog:
     RCC 2.0: on boot, reloads the tail of the on-disk log into the ring buffer
     so Dispatcher continuity survives restarts. The Raiken.run() boot sequence
     also calls build_boot_continuity_block() on startup to inject a compact
-    summary into Dispatcher's system prompt — she sees what she was mid-doing
-    before RCC last closed, rather than starting cold every launch.
+    summary into Dispatcher's system prompt — he sees what he was mid-doing
+    before RCC last closed, rather than starting cold every launch. (Dispatcher
+    is Raiken, who is he — all three surfaces share one pronoun set.)
     """
 
     def __init__(self, path: Path, max_entries: int = 500):
@@ -720,8 +721,8 @@ class DispatcherLog:
 
     def build_boot_continuity_block(self, limit: int = 30, max_chars: int = 2500) -> str:
         """Format recent entries into a compact text block for injection into
-        Dispatcher's system prompt at boot. Gives her a picture of what she
-        was mid-doing before the last restart so she doesn't start cold.
+        Dispatcher's system prompt at boot. Gives him a picture of what he
+        was mid-doing before the last restart so he doesn't start cold.
 
         Returns empty string if the log is empty (fresh install or cleared).
         Cap at max_chars to keep the boot prompt lean; prefer recency.
@@ -1289,7 +1290,7 @@ MEMORY_MCP_SERVER = create_sdk_mcp_server(
 # Previously Rook's voice/text broadcast automatically to both Speaker and
 # Dispatcher in parallel. That created a race where Speaker would ask "want me
 # to check on that?" while Dispatcher had already fired a worker. Now only
-# Speaker receives the user's text directly; she calls this tool to greenlight
+# Speaker receives the user's text directly; he calls this tool to greenlight
 # Dispatcher when work is actually warranted. Dispatcher stays silent until
 # told. Clean chain of command: Rook → Speaker → (authorize) → Dispatcher →
 # worker.
@@ -1833,7 +1834,7 @@ class Raiken:
 
         # Chain of command: Rook → Speaker → (authorize via request_dispatch
         # tool) → Dispatcher. No auto-broadcast anymore. Speaker decides
-        # whether work is warranted and calls request_dispatch herself; the
+        # whether work is warranted and calls request_dispatch himself; the
         # tool spawns a Dispatcher turn against the pre-authorized task. This
         # eliminates the race where Speaker asked Rook "want me to check?"
         # while Dispatcher had already fired.
@@ -2231,8 +2232,8 @@ class Raiken:
         # files are available. Without this each SDK starts cold every launch
         # and acts like it has no idea what project it's in.
         bootstrap = _build_bootstrap_context()
-        # Dispatcher gets a compact "recent activity" continuity block so she
-        # knows what she was doing before the last restart. Pulled from the
+        # Dispatcher gets a compact "recent activity" continuity block so he
+        # knows what he was doing before the last restart. Pulled from the
         # on-disk dispatcher log (which replays its tail at DispatcherLog
         # init). Empty on fresh installs / cleared logs. RCC 2.0 Phase 2.
         try:
