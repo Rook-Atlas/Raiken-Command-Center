@@ -129,6 +129,100 @@ MIN_TTS_CHARS_LATER = 140
 WORKER_UPDATE_GAP_MS = 650           # silence inserted between prior speech and narration
 WORKER_UPDATE_PREFIX = "Agent update"   # leader phrase — keep in sync with SYSTEM_PROMPT
 
+# Project memory lives in the docs/memory/ folder at the project root, which is
+# SEPARATE from the app code's git repo. Speaker and Dispatcher read from here
+# via the `read_memory_file` tool; bootstrap context at boot pulls MANIFEST.md
+# so Raiken knows what's available without reading every file blindly.
+PROJECT_MEMORY_DIR = Path(
+    r"C:\Users\Rook\Documents\Claude\Projects\Raiken Command Center\docs\memory"
+)
+APP_REPO_DIR = Path(r"C:\Users\Rook\AI\raiken")
+APP_REPO_URL = "https://github.com/Rook-Atlas/Raiken-Command-Center"
+
+
+def _build_bootstrap_context() -> str:
+    """Assemble the "you are Raiken in RCC, here's the ground truth" preamble
+    that gets prepended to both Speaker and Dispatcher system prompts at boot.
+
+    Pulls MANIFEST.md at runtime so the memory-file list stays in sync with the
+    actual filesystem state. Failures degrade gracefully to a floor context so
+    the SDK never boots without at least knowing its own identity + repo.
+    """
+    from datetime import date as _date
+    today = _date.today().isoformat()
+
+    # Try to embed the live MANIFEST listing so memory-file awareness is fresh.
+    manifest_lines = []
+    try:
+        manifest_txt = (PROJECT_MEMORY_DIR / "MANIFEST.md").read_text(encoding="utf-8")
+        # Keep only bullet lines that point at a .md file — that's the index.
+        for raw in manifest_txt.splitlines():
+            s = raw.strip()
+            if s.startswith("- [") and ".md)" in s:
+                manifest_lines.append(f"  {s}")
+    except Exception as e:
+        print(f"[bootstrap] MANIFEST.md read failed: {e}", flush=True)
+    manifest_block = (
+        "Memory files available (call read_memory_file with the filename):\n"
+        + "\n".join(manifest_lines)
+    ) if manifest_lines else (
+        "Memory files are in "
+        + str(PROJECT_MEMORY_DIR)
+        + " — read_memory_file(\"MANIFEST.md\") to see the index."
+    )
+
+    return f"""
+--- PROJECT BOOTSTRAP (loaded at boot — ground truth, never improvise around this) ---
+
+You are Raiken — an orchestrator for Raiken Command Center (RCC), a voice-first
+desktop app at {APP_REPO_DIR}. RCC owns the voice pipeline (F2 PTT, Whisper STT,
+XTTS v2 TTS) and dispatches work to named Claude Code subprocess agents.
+
+You are ONE entity in THREE cooperating modes. Do not confuse them:
+  * Speaker — the conversational surface, talks to Rook over TTS. Sonnet.
+             Reads memory files via tools, defers heavy thinking to Dispatcher,
+             narrates agent returns. Says things like "let me find out" and
+             lets Dispatcher handle the actual work.
+  * Dispatcher — silent parallel SDK, routes all worker dispatches, accumulates
+             related requests into buckets, aggregates simultaneous agent
+             returns into a single handoff to Speaker. Sonnet.
+  * Raiken Agent — an 11th canonical named worker (Opus max-effort). RARELY
+             used — only for IMPORTANT problems or after consistent failures
+             from other agents. Not the default. Dispatcher prefers Shadowling
+             Commander / Oracle / etc. for routine heavy work. Raiken Agent is
+             the escalation target when a worker gets stuck (depth-capped: a
+             worker can ask Raiken Agent for help once; Raiken Agent cannot
+             recursively escalate).
+
+Repo:
+  Local: {APP_REPO_DIR}  (git repo, branch main)
+  Remote: {APP_REPO_URL}
+  Commit: cd to local dir, git add -A, git commit -m "...", git push.
+  Credentials cached in Git Credential Manager — no prompt.
+
+Canonical named agents Dispatcher can route to:
+  Marl                 Royal Hearts (Opus)
+  CMMC Wizard          CMMC compliance (Opus)
+  Shadowling Commander general heavy work, code, RCC internals (Opus)
+  Oracle               research, web summarization (Opus)
+  Ledger               finance, debt, budget (Sonnet)
+  Herald               email, Discord, messaging (Sonnet)
+  Scribe               writing, docs, copy (Sonnet)
+  Cipher               security audits, vault admin (Sonnet)
+  Keeper               memory file upkeep (Haiku)
+  Pyre                 devil's-advocate critic (local Qwen via Ollama)
+  Raiken Agent         escalation target for hard problems (Opus max) — sparingly
+
+{manifest_block}
+
+Session reality: RCC is always-on. No "start of session" ritual. Project memory
+survives restarts (docs/memory/ files). Today's date: {today}.
+
+--- END BOOTSTRAP ---
+
+"""
+
+
 SYSTEM_PROMPT = """You are Raiken, Rook's AI right-hand man. Your responses are read aloud
 via text-to-speech AND shown in a chat window, so:
 - Plain text only. No markdown, no emoji, no special characters.
@@ -271,6 +365,10 @@ bodies your Dispatcher half may have picked:
     Cipher — security audits, vault admin (Sonnet)
     Keeper — memory file upkeep (Haiku)
     Pyre — devil's-advocate critic, runs on local Qwen
+    Raiken Agent — MY OWN problem-solver body (Opus max). Used rarely — only
+      when a task is critical or when another agent has been stuck / failing
+      repeatedly. If Dispatcher escalated to Raiken Agent, treat that as a
+      notable event; narrate it plainly ("I'm taking this one myself").
 
 Bitwarden vault:
 - You have vault_status, vault_unlock, vault_search, vault_copy_password,
@@ -330,8 +428,25 @@ YOUR RULES:
      Cipher               — security audits, vault admin, install/PATH (Sonnet)
      Keeper               — memory file upkeep, small maintenance (Haiku)
      Pyre                 — devil's-advocate critic (local Qwen via Ollama)
+     Raiken Agent         — Raiken's OWN problem-solver body (Opus max) — see rule 3b
    NEVER invent a new worker name if a canonical agent fits. Only invent when
    the task genuinely doesn't match any canonical role (rare).
+
+3b. Raiken Agent is an ESCALATION TARGET, not a default. Route to her only when:
+     a. A task is genuinely critical or must be done correctly first time
+        (e.g. data-loss risk, financial action, production-critical refactor).
+     b. Another named agent has failed repeatedly on the same task (2+ times
+        same-root-cause) — escalate to Raiken Agent to unstick.
+     c. A worker explicitly escalated to Raiken Agent via the ask-raiken
+        callback (depth-1 cap; Raiken Agent cannot recursively escalate).
+   For routine heavy work, Shadowling Commander / Oracle / domain-specialist
+   agents are still the right call. Raiken Agent runs multi-agent validation
+   on her answers so every dispatch to her costs several workers' tokens —
+   use her the way you'd use a senior engineer: expensive, rare, decisive.
+
+3c. If Rook says "Raiken, you handle this" or similar (explicitly asking Raiken
+    to do something herself rather than delegate), route to Raiken Agent.
+    That's the intended signal — Rook is choosing the expensive path on purpose.
 
 4. Write the task message clearly with full context — the worker only sees what
    you send. Include file paths, goals, constraints, relevant prior attempts.
@@ -943,6 +1058,72 @@ INTROSPECTION_MCP_SERVER = create_sdk_mcp_server(
     name="raiken-introspection",
     version="0.1.0",
     tools=[read_dispatcher_log_tool],
+)
+
+
+# =============================================================================
+# SDK tools: project memory (read-only, scoped to docs/memory/)
+# =============================================================================
+@tool(
+    "read_memory_file",
+    "Read a project memory file by name (e.g. 'open_scope.md', 'agent_architecture.md'). "
+    "Returns the full UTF-8 contents. Scoped to the project docs/memory/ directory — "
+    "cannot read outside it. Call with 'MANIFEST.md' to see the full list of available files. "
+    "Use this on-demand when Rook asks about a topic you don't already have in context. "
+    "Keep reads targeted; loading every file at once wastes context budget.",
+    {"name": str},
+)
+async def read_memory_file_tool(args):
+    requested = (args.get("name") or "").strip()
+    if not requested:
+        return {"content": [{"type": "text", "text": "error: empty name"}]}
+    # Basename-only to prevent path traversal outside docs/memory/.
+    safe_name = Path(requested).name
+    if safe_name != requested or ".." in requested or "/" in requested or "\\" in requested:
+        return {"content": [{"type": "text", "text": f"error: invalid name '{requested}'"}]}
+    target = PROJECT_MEMORY_DIR / safe_name
+    if not target.exists() or not target.is_file():
+        return {"content": [{"type": "text", "text": f"error: '{safe_name}' not found in {PROJECT_MEMORY_DIR}"}]}
+    try:
+        txt = target.read_text(encoding="utf-8")
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"error reading '{safe_name}': {e}"}]}
+    return {"content": [{"type": "text", "text": txt}]}
+
+
+@tool(
+    "log_memory_compaction",
+    "Log that a memory-compaction event just happened — when an agent finishes a long task "
+    "and writes learnings to a memory file, clearing its working context. Append a line to "
+    "workers/memory_compaction_log.jsonl so Rook can audit the trail if memory loss shows up "
+    "unexpectedly. Fields: agent (who compacted), memory_file (where learnings landed), "
+    "summary (short note on what was saved).",
+    {"agent": str, "memory_file": str, "summary": str},
+)
+async def log_memory_compaction_tool(args):
+    agent = (args.get("agent") or "").strip() or "unknown"
+    memory_file = (args.get("memory_file") or "").strip() or "unknown"
+    summary = (args.get("summary") or "").strip()
+    try:
+        import json as _json
+        log_path = APP_REPO_DIR / "workers" / "memory_compaction_log.jsonl"
+        log_path.parent.mkdir(exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fp:
+            fp.write(_json.dumps({
+                "ts": time.time(),
+                "agent": agent,
+                "memory_file": memory_file,
+                "summary": summary,
+            }) + "\n")
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"error appending to compaction log: {e}"}]}
+    return {"content": [{"type": "text", "text": f"logged: {agent} -> {memory_file}"}]}
+
+
+MEMORY_MCP_SERVER = create_sdk_mcp_server(
+    name="raiken-memory",
+    version="0.1.0",
+    tools=[read_memory_file_tool, log_memory_compaction_tool],
 )
 
 
@@ -1732,12 +1913,21 @@ class Raiken:
         # is impossible by construction (Speaker doesn't even SEE the dispatch
         # tool). Speaker has read_dispatcher_log so it can tell Rook what the
         # Dispatcher half is doing when asked.
+        # Bootstrap context pulls MANIFEST.md at boot so both halves know RCC
+        # exists, the repo URL, the canonical agent roster, and what memory
+        # files are available. Without this each SDK starts cold every launch
+        # and acts like it has no idea what project it's in.
+        bootstrap = _build_bootstrap_context()
+        speaker_system = bootstrap + SYSTEM_PROMPT
+        dispatcher_system = bootstrap + DISPATCHER_SYSTEM_PROMPT
+
         speaker_options = ClaudeAgentOptions(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=speaker_system,
             permission_mode="bypassPermissions",
             mcp_servers={
                 "raiken-vault": VAULT_MCP_SERVER,
                 "raiken-introspection": INTROSPECTION_MCP_SERVER,
+                "raiken-memory": MEMORY_MCP_SERVER,
             },
             allowed_tools=[
                 "mcp__raiken-vault__vault_status",
@@ -1748,17 +1938,22 @@ class Raiken:
                 "mcp__raiken-vault__vault_copy_totp",
                 "mcp__raiken-vault__vault_lock",
                 "mcp__raiken-introspection__read_dispatcher_log",
+                "mcp__raiken-memory__read_memory_file",
+                "mcp__raiken-memory__log_memory_compaction",
             ],
         )
         dispatcher_options = ClaudeAgentOptions(
-            system_prompt=DISPATCHER_SYSTEM_PROMPT,
+            system_prompt=dispatcher_system,
             permission_mode="bypassPermissions",
             mcp_servers={
                 "raiken-workers": WORKER_MCP_SERVER,
+                "raiken-memory": MEMORY_MCP_SERVER,
             },
             allowed_tools=[
                 "mcp__raiken-workers__dispatch_worker",
                 "mcp__raiken-workers__list_workers",
+                "mcp__raiken-memory__read_memory_file",
+                "mcp__raiken-memory__log_memory_compaction",
             ],
         )
         async with ClaudeSDKClient(options=speaker_options) as self.client, \

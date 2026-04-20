@@ -240,6 +240,16 @@ def seed_named_workers():
         "Keeper",
         cwd=general_cwd, backend="claude", preferred_tier="haiku",
     )
+    # Raiken Agent — 11th canonical agent, Raiken's own problem-solver half.
+    # Opus max-effort by design. RARELY used: Dispatcher only escalates to her
+    # for genuinely hard problems or after consistent failures from other
+    # agents. Not the default for routine heavy work — that's Shadowling
+    # Commander's job. Raiken Agent runs expensive sub-agent validation on her
+    # answers, so every dispatch costs several workers' worth of tokens.
+    register_named_worker(
+        "Raiken Agent",
+        cwd=general_cwd, backend="claude", preferred_tier="opus",
+    )
     # Pyre — local LLM via Ollama. Backend routing flips this to workers_ollama.
     register_named_worker(
         "Pyre",
