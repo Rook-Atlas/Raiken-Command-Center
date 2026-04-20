@@ -323,23 +323,30 @@ different agent. Say "I dispatched X to myself", "I've got an agent working
 on it", "let me check what I'm doing over there". The split is internal
 plumbing; to Rook it's one Raiken.
 
-Worker dispatch — YOU (the Speaker) DO NOT HAVE DISPATCH TOOLS.
+Worker dispatch — YOU (the Speaker) ARE THE GATE.
 
-Your Dispatcher half does. Every message Rook sends reaches both halves at
-once. You respond conversationally; your Dispatcher half evaluates the same
-message and fires the worker in parallel. The Speaker stream and the
-Dispatcher stream don't share state — you coordinate through the dispatcher
-log (see below) and through [worker-updates] preambles on later turns.
+Only YOU receive Rook's message directly. Your Dispatcher surface no longer
+auto-fires. To route work, you MUST call the tool `request_dispatch(task,
+reason)`. That tool wakes the Dispatcher surface with a pre-authorized task;
+Dispatcher then picks the agent and fires. If you don't call request_dispatch,
+NO work gets dispatched — you chose conversational-only.
+
+Chain of command:
+  Rook → Speaker (you) → request_dispatch → Dispatcher → worker
 
 How this changes your behavior:
-- When Rook asks for work, acknowledge briefly in first person ("on it",
-  "sending someone out", "I'm on it") — your Dispatcher half will already
-  be firing by the time you finish the sentence.
-- Do NOT try to dispatch yourself from THIS session. You have no dispatch
-  tool here. Attempting it does nothing.
+- When Rook asks for work, (1) acknowledge briefly in first person ("on it",
+  "sending someone out"), (2) call request_dispatch with a short task
+  summary and one-line reason. The tool returns immediately; Dispatcher
+  runs in the background, result lands in a later [worker-updates] preamble.
+- When Rook is just CHATTING (questions about state, preferences, yes/no,
+  small talk), do NOT call request_dispatch. Just answer.
 - Do NOT pre-name a specific agent ("dispatching Oracle") — you don't yet
-  know which agent your Dispatcher half picked. Check the dispatcher log or
-  wait for the [worker-updates] return.
+  know which agent your Dispatcher surface picked. Check the dispatcher log
+  or wait for the [worker-updates] return.
+- NEVER ask Rook "want me to get someone to check on that?" — if work is
+  warranted, just authorize it via request_dispatch. He told you what he
+  wanted by saying it; asking permission again is paternalistic delay.
 - On your NEXT turn, any workers that completed appear in a [worker-updates]
   preamble. Begin each update with an explicit announcement prefix to signal
   to Rook that this is a NEW worker return, not a continuation of your prior
@@ -424,9 +431,11 @@ to Rook right now. The Speaker and the Dispatcher are two functional halves
 of one Raiken, each with a different job. This is internal plumbing — to Rook
 you are one person.
 
-Your half is silent. The Speaker half handles conversation; your job is to
-fire worker dispatches in parallel so work starts immediately without Rook
-having to wait for the conversational turn to finish.
+Your surface is silent. The Speaker surface handles conversation and is now
+the GATE — every task you receive has been pre-authorized by Speaker via
+the request_dispatch tool. Rook's raw messages do NOT reach you directly
+anymore; Speaker decides whether work is warranted and hands you the task
+with a reason attached.
 
 YOUR RULES:
 
@@ -438,13 +447,11 @@ YOUR RULES:
    into your dispatcher log and the Speaker may read it when Rook asks
    "what are you doing over there?"
 
-2. Decide per message whether a worker dispatch is warranted:
-   - YES: any request to DO something — edit code, fix a bug, investigate,
-          build, research, audit, analyze, refactor, summarize emails, pull
-          finance data, ship a feature, debug RCC itself, etc.
-   - NO:  conversational chat, questions about your own state, yes/no answers,
-          preferences, "hi", vault operations (the Speaker half owns those),
-          or generic small talk. When in doubt: do nothing.
+2. Your input is ALWAYS pre-authorized. The task text you receive has
+   already been judged worthy of dispatch by the Speaker surface. Your job
+   is NOT to re-decide "should I dispatch at all" — the answer is yes. Your
+   job is "which agent, with what task text." Only skip a dispatch if the
+   task text is genuinely empty or nonsensical.
 
 3. Prefer canonical named agents. Each has a stable persistent session and a
    defined role:
@@ -1158,6 +1165,63 @@ MEMORY_MCP_SERVER = create_sdk_mcp_server(
 
 
 # =============================================================================
+# SDK tool: dispatch gate (Speaker's go-ahead signal to the Dispatcher surface)
+# =============================================================================
+# Previously Rook's voice/text broadcast automatically to both Speaker and
+# Dispatcher in parallel. That created a race where Speaker would ask "want me
+# to check on that?" while Dispatcher had already fired a worker. Now only
+# Speaker receives the user's text directly; she calls this tool to greenlight
+# Dispatcher when work is actually warranted. Dispatcher stays silent until
+# told. Clean chain of command: Rook → Speaker → (authorize) → Dispatcher →
+# worker.
+@tool(
+    "request_dispatch",
+    "Greenlight the Dispatcher surface to route a worker for this request. "
+    "Call this when Rook asks for WORK (investigate / edit / fix / research / "
+    "analyze / ship / build). Don't call for conversational replies, "
+    "questions about your state, or vault operations. Task should be a short "
+    "summary of what the worker needs to do — Dispatcher will pick the agent "
+    "and expand the task text. Reason is for the audit log so Rook can see "
+    "why you authorized. The call returns immediately; Dispatcher runs in the "
+    "background and the worker result will land in a later [worker-updates] "
+    "preamble.",
+    {"task": str, "reason": str},
+)
+async def request_dispatch_tool(args):
+    task = (args.get("task") or "").strip()
+    reason = (args.get("reason") or "").strip()
+    if not task:
+        return {"content": [{"type": "text", "text": "error: task required"}]}
+    if _APP_REF is None or _APP_REF.raiken is None:
+        return {"content": [{"type": "text", "text": "error: RCC core not ready"}]}
+    raiken = _APP_REF.raiken
+    if raiken.dispatcher_client is None:
+        return {"content": [{"type": "text", "text": "error: Dispatcher surface not yet booted"}]}
+    # Log the authorization in the dispatcher log so Speaker can read it back
+    # via read_dispatcher_log when Rook asks "what did you send?".
+    try:
+        DISPATCHER_LOG.record(
+            "authorize", task=task[:300], reason=reason[:200],
+        )
+    except Exception:
+        pass
+    # Fire Dispatcher turn in background — Speaker's turn shouldn't block on it.
+    try:
+        asyncio.create_task(raiken._execute_dispatcher_turn(task))
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"error scheduling dispatcher turn: {e}"}]}
+    preview = task[:80] + ("…" if len(task) > 80 else "")
+    return {"content": [{"type": "text", "text": f"authorized: {preview}"}]}
+
+
+DISPATCH_GATE_MCP_SERVER = create_sdk_mcp_server(
+    name="raiken-dispatch-gate",
+    version="0.1.0",
+    tools=[request_dispatch_tool],
+)
+
+
+# =============================================================================
 # Raiken core (runs on asyncio worker thread)
 # =============================================================================
 class Raiken:
@@ -1199,6 +1263,16 @@ class Raiken:
         self._context_usage: dict | None = None   # {total, max, pct, model}
         self._rate_limits: dict = {}              # type -> {utilization, resets_at, status}
         self._usage_lock = threading.Lock()
+
+        # Latency instrumentation. `_ptt_release_ts` is set by _on_release and
+        # read by downstream hops (STT, first LLM token, first TTS chunk, first
+        # ffplay spawn) so each can log its delta from PTT release. One slot —
+        # the most recent PTT release wins (barge-in resets it). Every log
+        # tagged `[lat]` so they grep together.
+        self._ptt_release_ts: float = 0.0
+        self._lat_first_llm_text_logged: bool = False
+        self._lat_first_tts_synth_logged: bool = False
+        self._lat_first_playback_logged: bool = False
 
     # --- UI emit helpers ------------------------------------------------------
     def _emit_chat(self, role: str, text: str, append: bool = False, done: bool = False):
@@ -1313,6 +1387,17 @@ class Raiken:
             # Audio too short to be speech — flush deferred wakes now.
             self._flush_deferred_wake()
             return
+        # Stamp PTT release for latency logging. All downstream hops (STT, first
+        # LLM chunk, first TTS synth, first playback) print their delta from
+        # this timestamp so Rook can diagnose where the seconds go on any turn.
+        self._ptt_release_ts = time.time()
+        self._lat_first_llm_text_logged = False
+        self._lat_first_tts_synth_logged = False
+        self._lat_first_playback_logged = False
+        print(
+            f"[lat] ptt-release audio_dur={duration:.2f}s",
+            flush=True,
+        )
         # Real speech captured: voice_turn → submit() → _execute_turn() will prepend
         # any pending worker results via [worker-updates] preamble. Don't also fire
         # the auto-wake or the results would surface twice.
@@ -1432,11 +1517,21 @@ class Raiken:
                 if self._barge_flag:
                     continue
                 try:
+                    t0 = time.time()
                     r = http.post(TTS_URL, json={"text": item, "play": False})
                     r.raise_for_status()
                     wav_path = r.json().get("path")
+                    synth_ms = (time.time() - t0) * 1000
                     # Check again after synth — the user may have barged DURING the POST.
                     if wav_path and not self._barge_flag:
+                        if not self._lat_first_tts_synth_logged and self._ptt_release_ts:
+                            d_ptt = (time.time() - self._ptt_release_ts) * 1000
+                            print(
+                                f"[lat] tts_first_synth synth_ms={synth_ms:.0f} "
+                                f"chars={len(item)} d_ptt={d_ptt:.0f}ms",
+                                flush=True,
+                            )
+                            self._lat_first_tts_synth_logged = True
                         self.wav_q.put(wav_path)
                 except Exception as e:
                     print(f"[synth fail: {e}]", flush=True)
@@ -1450,6 +1545,13 @@ class Raiken:
             if self._barge_flag:
                 continue
             try:
+                if not self._lat_first_playback_logged and self._ptt_release_ts:
+                    d_ptt = (time.time() - self._ptt_release_ts) * 1000
+                    print(
+                        f"[lat] tts_first_playback d_ptt={d_ptt:.0f}ms",
+                        flush=True,
+                    )
+                    self._lat_first_playback_logged = True
                 proc = subprocess.Popen(
                     ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", item],
                     stdin=subprocess.DEVNULL,
@@ -1467,16 +1569,28 @@ class Raiken:
 
     # --- STT ------------------------------------------------------------------
     def _run_stt_sync(self, audio: np.ndarray) -> str:
-        print(f"[stt] duration={len(audio)/SAMPLE_RATE:.2f}s", flush=True)
+        dur = len(audio) / SAMPLE_RATE
+        print(f"[stt] duration={dur:.2f}s", flush=True)
+        t0 = time.time()
         segments, info = self.whisper.transcribe(
             audio, beam_size=1, language="en",
             initial_prompt=PROJECT_VOCAB,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
         )
+        # segments is a lazy generator — iteration is where the forward pass
+        # happens. We time the full iteration so the log reflects true STT
+        # wall-clock, not the VAD preprocess alone.
         text = " ".join(s.text.strip() for s in segments).strip()
+        stt_ms = (time.time() - t0) * 1000
         for pattern, replacement in STT_REPLACEMENTS:
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        ptt0 = self._ptt_release_ts
+        since_ptt = f" d_ptt={(time.time() - ptt0) * 1000:.0f}ms" if ptt0 else ""
+        print(
+            f"[lat] stt_done stt_ms={stt_ms:.0f}{since_ptt} chars={len(text)}",
+            flush=True,
+        )
         return text
 
     # --- Turn handling --------------------------------------------------------
@@ -1598,12 +1712,12 @@ class Raiken:
         # — Rook didn't say anything; Raiken should narrate briefly and stop.
         is_worker_return_wake = text.strip().startswith("[WORKER-RETURN]")
 
-        # Dispatcher broadcast. Fire in parallel with the Speaker's turn so
-        # dispatch evaluation doesn't block conversation. Skip synthetic
-        # worker-return wakes — those are narration-only; the Dispatcher has
-        # nothing to decide.
-        if not is_worker_return_wake and self.dispatcher_client is not None:
-            asyncio.create_task(self._execute_dispatcher_turn(text))
+        # Chain of command: Rook → Speaker → (authorize via request_dispatch
+        # tool) → Dispatcher. No auto-broadcast anymore. Speaker decides
+        # whether work is warranted and calls request_dispatch herself; the
+        # tool spawns a Dispatcher turn against the pre-authorized task. This
+        # eliminates the race where Speaker asked Rook "want me to check?"
+        # while Dispatcher had already fired.
 
         _display_text = text  # saved before preamble injection so the UI shows only Rook's words
         if _APP_REF is not None:
@@ -1640,14 +1754,14 @@ class Raiken:
                 print("[worker-return] wake fired but queue already empty; skipping", flush=True)
                 return
 
-        # Drain any stale items left over from a prior barge-in — synth/playback
-        # threads might still be holding stuff.
-        for _q in (self.sentence_q, self.wav_q):
-            while True:
-                try:
-                    _q.get_nowait()
-                except queue.Empty:
-                    break
+        # Do NOT drain sentence_q / wav_q here on a clean transition — the
+        # prior turn's synth/playback threads may still be holding sentences
+        # mid-flight, and draining would cut off the tail of the previous
+        # speech (Rook: "raiken interrupted himself and never finished out
+        # the TTS of the first message"). _barge_in() already drains these
+        # queues when a real barge happens, so by the time we get here they
+        # are either empty (normal case) or carrying the tail of the previous
+        # turn we want to preserve.
 
         # Show the user's original text in the UI. Skip for auto-wake turns —
         # Rook didn't say anything, and the worker output is already visible via
@@ -1684,20 +1798,26 @@ class Raiken:
         print("[raiken] ", end="", flush=True)
         first_text = True
         buffer = ""
+        # Post-barge drain state — populated on first in-loop barge detection.
+        # We suppress emission but keep iterating so the SDK's message queue
+        # doesn't carry the abandoned response's tail into the next query.
+        # Capped at BARGE_DRAIN_TIMEOUT_SEC so Rook doesn't wait forever on a
+        # long abandoned generation before his next turn fires — we take the
+        # "one behind" risk over the "PTT feels broken" risk.
+        BARGE_DRAIN_TIMEOUT_SEC = 3.0
+        barge_drain_deadline: float | None = None
         async for msg in self.client.receive_response():
-            # Barge happened — keep iterating but suppress all emission so the
-            # next query() doesn't read leftover tokens from this abandoned
-            # turn. WHY: receive_response yields from the SDK's per-client
-            # message queue, not a per-turn one. If we `break` here while the
-            # model is still streaming, the SDK keeps shoving A's tokens onto
-            # the queue. The NEXT query(B) then sees A's tail FIRST and
-            # delivers it as B's response — which is the "Raiken is one turn
-            # behind" bug Rook hits after every barge. Draining to A's
-            # ResultMessage before returning costs us some perceived
-            # responsiveness on B but guarantees B's response is actually B.
             if self._barge_flag:
+                if barge_drain_deadline is None:
+                    barge_drain_deadline = time.monotonic() + BARGE_DRAIN_TIMEOUT_SEC
+                    print(" [draining]", end="", flush=True)
+                if time.monotonic() > barge_drain_deadline:
+                    # Give up the drain. Some bleedthrough possible on the next
+                    # turn; the timeout protects PTT responsiveness.
+                    print(" [drain-timeout]", flush=True)
+                    break
                 if isinstance(msg, ResultMessage):
-                    print(" [drained-after-barge]", flush=True)
+                    print(" [drained]", flush=True)
                     break
                 continue
             if isinstance(msg, RateLimitEvent):
@@ -1713,6 +1833,13 @@ class Raiken:
                         print(chunk, end="", flush=True)
                         # UI gets the full chunk (code blocks + all).
                         self._emit_chat("raiken", chunk, append=not first_text)
+                        if not self._lat_first_llm_text_logged and self._ptt_release_ts:
+                            d_ptt = (time.time() - self._ptt_release_ts) * 1000
+                            print(
+                                f"\n[lat] llm_first_text d_ptt={d_ptt:.0f}ms",
+                                flush=True,
+                            )
+                            self._lat_first_llm_text_logged = True
                         first_text = False
                         # TTS gets only the non-code-block portion.
                         tts_chunk = self._strip_code_blocks_for_tts(chunk)
@@ -1917,8 +2044,45 @@ class Raiken:
         self.whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
         print(f"[raiken] Whisper ready ({time.time()-t0:.1f}s)", flush=True)
 
+        # Warmup: faster-whisper JITs CUDA kernels on the first transcribe at
+        # each unique input shape, which adds 300-800ms to the first real
+        # utterance. Running one throwaway pass now hides that cost before
+        # Rook hits F2. Audio is 1s of near-silence (low amplitude random so
+        # VAD doesn't completely strip it); result is discarded.
+        try:
+            t0 = time.time()
+            dummy = (np.random.randn(SAMPLE_RATE).astype(np.float32) * 1e-4)
+            segs, _ = self.whisper.transcribe(
+                dummy, beam_size=1, language="en", vad_filter=False,
+            )
+            _ = " ".join(s.text for s in segs)
+            print(f"[raiken] Whisper warmup done ({(time.time()-t0)*1000:.0f}ms)", flush=True)
+        except Exception as e:
+            print(f"[raiken] Whisper warmup failed (non-fatal): {e}", flush=True)
+
         if tts_launched:
             await self._wait_for_tts()
+
+        # Warmup: XTTS first inference JITs CUDA kernels too (~1-2s penalty
+        # on the first real sentence). Fire a tiny synth now so the first
+        # turn doesn't eat the cost. Runs in a thread so it doesn't block
+        # the event loop if the TTS server is slow to wake.
+        async def _tts_warmup():
+            try:
+                def _blocking():
+                    t0 = time.time()
+                    with httpx.Client(timeout=30) as http:
+                        r = http.post(
+                            TTS_URL,
+                            json={"text": "Ready.", "play": False},
+                        )
+                        r.raise_for_status()
+                    return (time.time() - t0) * 1000
+                ms = await asyncio.to_thread(_blocking)
+                print(f"[raiken] XTTS warmup done ({ms:.0f}ms)", flush=True)
+            except Exception as e:
+                print(f"[raiken] XTTS warmup failed (non-fatal): {e}", flush=True)
+        asyncio.create_task(_tts_warmup())
 
         threading.Thread(target=self._synthesis_worker, daemon=True).start()
         threading.Thread(target=self._playback_worker, daemon=True).start()
@@ -1958,6 +2122,7 @@ class Raiken:
                 "raiken-vault": VAULT_MCP_SERVER,
                 "raiken-introspection": INTROSPECTION_MCP_SERVER,
                 "raiken-memory": MEMORY_MCP_SERVER,
+                "raiken-dispatch-gate": DISPATCH_GATE_MCP_SERVER,
             },
             allowed_tools=[
                 "mcp__raiken-vault__vault_status",
@@ -1970,6 +2135,7 @@ class Raiken:
                 "mcp__raiken-introspection__read_dispatcher_log",
                 "mcp__raiken-memory__read_memory_file",
                 "mcp__raiken-memory__log_memory_compaction",
+                "mcp__raiken-dispatch-gate__request_dispatch",
             ],
         )
         dispatcher_options = ClaudeAgentOptions(
