@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -154,19 +155,19 @@ class WorkerStatusEvent:
 
 
 @dataclass
-class DispatcherStatusEvent:
-    """Emitted by Raiken's Dispatcher half (the silent SDK) so the UI can
-    confirm that the Dispatcher heard the user's message and show what it's
+class ForemanStatusEvent:
+    """Emitted by Raiken's Foreman half (the silent SDK) so the UI can
+    confirm that the Foreman heard the user's message and show what it's
     doing. Raiken is one entity running in two modes: the Speaker (converses
-    with Rook) and the Dispatcher (silently fires worker dispatches). Both
+    with Rook) and the Foreman (silently fires worker dispatches). Both
     receive every user message.
 
     state values:
       'thinking'    — stream opened, no tool call yet
-      'dispatched'  — Dispatcher called dispatch_worker (detail = worker name)
+      'dispatched'  — Foreman called dispatch_worker (detail = worker name)
       'idle'        — stream ended with no dispatch (heard, chose not to act)
       'failed'      — stream errored out
-      'probing'     — Dispatcher called list_workers (informational)
+      'probing'     — Foreman called list_workers (informational)
     """
     state: str
     detail: str = ""
@@ -175,22 +176,57 @@ class DispatcherStatusEvent:
 # -----------------------------------------------------------------------------
 # Task-summary heuristic (no LLM call — just first meaningful line of prompt)
 # -----------------------------------------------------------------------------
+_UI_LEADING_METADATA_LABEL = re.compile(
+    r"^\s*[A-Z][A-Z0-9\-']{2,}(?:\s+\S+?)*?\s*[—:]\s+"
+)
+_UI_META_LOW_PREFIXES = (
+    "rook asked", "rook wants", "rook just", "rook explicitly", "rook said",
+    "follow-up", "follow up to", "additional item", "another item",
+    "new task", "next task", "next item",
+    "first item", "second item", "third item", "fourth item", "fifth item",
+    "sixth item",
+    "context:", "background:", "repo:", "branch:",
+)
+
+
 def _extract_task_summary(task: str, max_len: int = 80) -> str:
     """Return a short one-line summary from a dispatch task prompt.
 
-    Skips blank lines, bracketed tags, and greeting-style preamble so the
-    first REAL sentence describing the goal surfaces as the initial status.
+    Skips blank lines, bracketed tags, ALL-CAPS label prefixes, attribution
+    phrases ("Rook asked…"), and other metadata so the first REAL sentence
+    describing the goal surfaces as the initial status. Fallback path only —
+    the live status channel (WorkerStatusEvent) normally overrides this
+    immediately after dispatch via main.py `_short_status`.
     """
     if not task:
         return ""
+    task = _UI_LEADING_METADATA_LABEL.sub("", task, count=1)
     for line in task.splitlines():
         line = line.strip().lstrip("-•*#").strip()
         if len(line) < 12:
             continue
         if line.startswith("[") or line.lower().startswith("you are"):
             continue
+        low = line.lower()
+        if any(low.startswith(p) for p in _UI_META_LOW_PREFIXES):
+            continue
+        if line.endswith(":") and len(line.split()) <= 6:
+            continue
         return (line[:max_len] + "…") if len(line) > max_len else line
     return (task[:max_len] + "…") if len(task) > max_len else task
+
+
+# Map internal worker registry keys to their human-readable UI labels.
+# Registry keys stay untouched so Claude Code session resume (which keys off the
+# worker name) keeps working; this is for display only.
+_DISPLAY_NAME_OVERRIDES = {
+    "Raiken Agent": "Raiken",
+    "Shadowling Commander": "S. Commander",
+}
+
+
+def _display_name(name: str) -> str:
+    return _DISPLAY_NAME_OVERRIDES.get(name, name)
 
 
 # -----------------------------------------------------------------------------
@@ -386,30 +422,30 @@ class RaikenWindow:
         self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         self._spinner_idx = 0
 
-        # Dispatcher activity chip. Raiken has two SDK "halves": the Speaker
-        # (conversational, this spinner above) and the Dispatcher (silent,
+        # Foreman activity chip. Raiken has two SDK "halves": the Speaker
+        # (conversational, this spinner above) and the Foreman (silent,
         # fires workers). Sits next to the Speaker spinner so Rook can see
         # both halves at a glance. Distinctly purple palette so it can't be
         # confused with the Speaker's orange spinner. States:
         #   idle/—      gray      (dim — no turn in flight)
         #   thinking    violet    (stream opened, no tool call yet)
-        #   probing     steel     (Dispatcher called list_workers)
-        #   dispatched  green     (Dispatcher dispatched a worker; detail=name)
-        #   failed      red       (Dispatcher stream errored)
-        self.dispatcher_label = tk.Label(
-            status, text="\u25C6 Dispatcher: —", fg="#666", bg=BG_PANEL,
+        #   probing     steel     (Foreman called list_workers)
+        #   dispatched  green     (Foreman dispatched a worker; detail=name)
+        #   failed      red       (Foreman stream errored)
+        self.foreman_label = tk.Label(
+            status, text="\u25C6 Foreman: —", fg="#666", bg=BG_PANEL,
             font=("Segoe UI", 9, "bold"), padx=10, pady=8,
         )
-        self.dispatcher_label.pack(side=tk.LEFT)
-        self._dispatcher_state: str = "idle"
-        self._dispatcher_detail: str = ""
+        self.foreman_label.pack(side=tk.LEFT)
+        self._foreman_state: str = "idle"
+        self._foreman_detail: str = ""
         # When a dispatched/idle/failed state arrives we show it for a few
         # seconds then auto-fade back to the dim "—" idle look, so the chip
         # doesn't get stuck stale between turns.
-        self._dispatcher_clear_after_id: str | None = None
+        self._foreman_clear_after_id: str | None = None
         # Remembered last dispatch target — surfaced as a tooltip on the chip
         # so Rook can see what was last sent even after the chip fades.
-        self._dispatcher_last_target: str = ""
+        self._foreman_last_target: str = ""
 
         # Presence indicator + manual override toggle. Three display states:
         # active (green), maybe (amber — recent but no very-recent input),
@@ -847,8 +883,8 @@ class RaikenWindow:
                     self._apply_worker_status(evt)
                 elif isinstance(evt, PresenceEvent):
                     self._apply_presence(evt)
-                elif isinstance(evt, DispatcherStatusEvent):
-                    self._apply_dispatcher_status(evt)
+                elif isinstance(evt, ForemanStatusEvent):
+                    self._apply_foreman_status(evt)
         except queue.Empty:
             pass
         finally:
@@ -946,7 +982,7 @@ class RaikenWindow:
         row1.pack(fill=tk.X)
         tk.Label(row1, text="\u2197", fg="#c87020", bg=bg, font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 5))
         tk.Label(row1, text="worker", fg="#777", bg=bg, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(row1, text=evt.name, fg="#e89030", bg=bg, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        tk.Label(row1, text=_display_name(evt.name), fg="#e89030", bg=bg, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         # Row 2: tier label + live running indicator
         row2 = tk.Frame(badge, bg=bg)
         row2.pack(fill=tk.X, pady=(2, 0))
@@ -1208,7 +1244,7 @@ class RaikenWindow:
                 relief=tk.FLAT, highlightthickness=1, highlightbackground="#3a3a3a",
             )
             tk.Label(badge, text="\u2699", fg=FG_MUTED, bg=bg, font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 5))
-            tk.Label(badge, text=evt.name, fg="#ddd", bg=bg, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+            tk.Label(badge, text=_display_name(evt.name), fg="#ddd", bg=bg, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
             tk.Label(badge, text=f"  {status_glyph_ui}  {evt.elapsed:.1f}s",
                      fg=status_color, bg=bg, font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(6, 0))
             tk.Label(badge, text="  view in Log \u2192", fg="#555", bg=bg, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(8, 0))
@@ -1316,75 +1352,75 @@ class RaikenWindow:
             fg=colors.get(evt.state, FG_MUTED), text=txt
         )
 
-    def _apply_dispatcher_status(self, evt: "DispatcherStatusEvent"):
-        """Update the Dispatcher activity chip. Confirms to Rook that
-        Raiken's Dispatcher half heard the message (it runs silently, so
-        without this the Dispatcher side gives no visible feedback).
+    def _apply_foreman_status(self, evt: "ForemanStatusEvent"):
+        """Update the Foreman activity chip. Confirms to Rook that
+        Raiken's Foreman half heard the message (it runs silently, so
+        without this the Foreman side gives no visible feedback).
         Purple-family palette so it's distinct from the Speaker's orange
         spinner."""
-        if not hasattr(self, "dispatcher_label") or self.dispatcher_label is None:
+        if not hasattr(self, "foreman_label") or self.foreman_label is None:
             return
-        self._dispatcher_state = evt.state
-        self._dispatcher_detail = evt.detail or ""
+        self._foreman_state = evt.state
+        self._foreman_detail = evt.detail or ""
 
         if evt.state == "thinking":
-            txt = "\u25C6 Dispatcher: listening\u2026"
+            txt = "\u25C6 Foreman: listening\u2026"
             fg = "#a78bfa"   # violet
             sticky = True
         elif evt.state == "probing":
-            txt = "\u25C6 Dispatcher: checking roster\u2026"
+            txt = "\u25C6 Foreman: checking roster\u2026"
             fg = "#8aa7d8"   # steel blue
             sticky = True
         elif evt.state == "dispatched":
             name = (evt.detail or "worker").strip()
-            self._dispatcher_last_target = name
-            txt = f"\u25C6 Dispatcher \u2192 {name}"
+            self._foreman_last_target = name
+            txt = f"\u25C6 Foreman \u2192 {_display_name(name)}"
             fg = "#5cb85c"   # green
             sticky = False
         elif evt.state == "failed":
             extra = f" ({evt.detail})" if evt.detail else ""
-            txt = f"\u25C6 Dispatcher: failed{extra}"
+            txt = f"\u25C6 Foreman: failed{extra}"
             fg = "#d9534f"   # red
             sticky = False
         else:  # idle / fallback
-            txt = "\u25C6 Dispatcher: heard, no-op"
+            txt = "\u25C6 Foreman: heard, no-op"
             fg = "#888"
             sticky = False
 
-        self.dispatcher_label.configure(text=txt, fg=fg)
+        self.foreman_label.configure(text=txt, fg=fg)
         # Tooltip text: remembers the last dispatch target across fade-outs.
-        self.dispatcher_label._full_text = (
-            f"last dispatch: {self._dispatcher_last_target}"
-            if self._dispatcher_last_target
-            else "Raiken Dispatcher \u2014 silent worker dispatch half"
+        self.foreman_label._full_text = (
+            f"last dispatch: {_display_name(self._foreman_last_target)}"
+            if self._foreman_last_target
+            else "Raiken Foreman \u2014 silent worker dispatch half"
         )
 
         # Cancel any pending auto-clear from a previous turn.
-        if self._dispatcher_clear_after_id is not None:
+        if self._foreman_clear_after_id is not None:
             try:
-                self.root.after_cancel(self._dispatcher_clear_after_id)
+                self.root.after_cancel(self._foreman_clear_after_id)
             except Exception:
                 pass
-            self._dispatcher_clear_after_id = None
+            self._foreman_clear_after_id = None
 
         # Non-sticky terminal states fade back to dim after a few seconds
         # so the chip isn't stuck showing stale info between turns.
         if not sticky:
-            self._dispatcher_clear_after_id = self.root.after(
-                6000, self._clear_dispatcher_label
+            self._foreman_clear_after_id = self.root.after(
+                6000, self._clear_foreman_label
             )
 
-    def _clear_dispatcher_label(self):
-        self._dispatcher_clear_after_id = None
-        if not hasattr(self, "dispatcher_label") or self.dispatcher_label is None:
+    def _clear_foreman_label(self):
+        self._foreman_clear_after_id = None
+        if not hasattr(self, "foreman_label") or self.foreman_label is None:
             return
-        self._dispatcher_state = "idle"
-        self._dispatcher_detail = ""
-        if self._dispatcher_last_target:
-            txt = f"\u25C6 Dispatcher: \u2014  (last: {self._dispatcher_last_target})"
+        self._foreman_state = "idle"
+        self._foreman_detail = ""
+        if self._foreman_last_target:
+            txt = f"\u25C6 Foreman: \u2014  (last: {self._foreman_last_target})"
         else:
-            txt = "\u25C6 Dispatcher: \u2014"
-        self.dispatcher_label.configure(text=txt, fg="#666")
+            txt = "\u25C6 Foreman: \u2014"
+        self.foreman_label.configure(text=txt, fg="#666")
 
     def _cycle_presence_override(self):
         """Rotate the manual presence override: auto \u2192 active \u2192 away \u2192 auto.
@@ -1754,9 +1790,16 @@ class RaikenWindow:
         # immediately after their parent and rendered with an indent so the
         # tree is legible at a glance.
         named_by_name = {a.get("name", ""): a for a in named if a.get("name")}
+        # "Raiken Agent" (display name: Raiken) pins to the top; everything else
+        # follows the usual tier-then-alpha order. Key tuple: (not-raiken, tier, name)
+        # so Raiken's False beats all True.
         top_level: list[str] = sorted(
             named_by_name.keys(),
-            key=lambda n: (self._tier_sort_key(self._agent_tier(named_by_name[n])), n.lower()),
+            key=lambda n: (
+                n != "Raiken Agent",
+                self._tier_sort_key(self._agent_tier(named_by_name[n])),
+                n.lower(),
+            ),
         )
         # Ephemeral top-level actives (not in registry, no parent) after named.
         for n in active.keys():
@@ -1849,7 +1892,7 @@ class RaikenWindow:
                 )
                 tier_lbl.pack(side=tk.LEFT, padx=(0, 6))
                 name_lbl = tk.Label(
-                    top, text=f"{name_prefix}{name}", fg=name_fg, bg=row_bg,
+                    top, text=f"{name_prefix}{_display_name(name)}", fg=name_fg, bg=row_bg,
                     font=("Segoe UI", 10, "bold"), anchor="w",
                 )
                 name_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -1934,7 +1977,7 @@ class RaikenWindow:
                     row.bottom.configure(bg=row_bg)
                     row.tier_lbl.configure(fg=tier_fg, bg=row_bg)
                     row.name_lbl.configure(
-                        fg=name_fg, bg=row_bg, text=f"{name_prefix}{name}",
+                        fg=name_fg, bg=row_bg, text=f"{name_prefix}{_display_name(name)}",
                     )
                     row.status_lbl.configure(fg=status_fg, bg=row_bg, text=status_txt)
                     row.tier_label_lbl.configure(bg=row_bg)

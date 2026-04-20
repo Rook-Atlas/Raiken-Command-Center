@@ -185,6 +185,20 @@ def register_named_worker(
         ):
             if val is not None:
                 existing[key] = val
+        # If the caller passes a session_id matching the entry's, the seed is
+        # asserting "this session already exists on disk — use --resume." Force
+        # session_created=True so dispatch picks --resume over --session-id.
+        # Without this, a pre-seeded worker whose registry was first written
+        # before the session_id was added (or got session_created=False any
+        # other way) keeps trying to CREATE the session on every dispatch and
+        # the CLI rejects it with "Session ID ... is already in use" because
+        # the .jsonl already exists.
+        if (
+            session_id
+            and existing.get("session_id") == session_id
+            and not existing.get("session_created")
+        ):
+            existing["session_created"] = True
         # Canonical flag distinguishes pre-seeded named agents from ad-hoc worker
         # entries (e.g. old "test-worker" / "raiken-ui" dispatches). UI uses this
         # to filter the agent panel.
@@ -261,7 +275,7 @@ def seed_named_workers():
     # downgraded by budget). ADVISES other agents; does NOT take over their
     # tasks. When a worker calls ask-raiken, Raiken Agent returns guidance and
     # the worker continues. When Rook explicitly asks Raiken himself to handle
-    # something, Dispatcher routes here. Runs with max reasoning effort by
+    # something, Foreman routes here. Runs with max reasoning effort by
     # design — every dispatch is expensive, treat him as the senior consultant.
     register_named_worker(
         "Raiken Agent",

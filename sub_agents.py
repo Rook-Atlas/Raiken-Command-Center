@@ -105,9 +105,9 @@ def infer_tier_from_name(name: str) -> str | None:
 #   "ask_speaker"  = forwarded to Speaker for a silent yes/no (future)
 # max_sub_agents_per_parent — hard ceiling so a runaway parent can't spawn
 #   indefinitely.
-# max_depth — 1 = sub-agents cannot spawn sub-sub-agents. Raiken Dispatcher
+# max_depth — 1 = sub-agents cannot spawn sub-sub-agents. Raiken Foreman
 #   is depth 0; a named agent's sub-agent is depth 1. Rook's spec: "Raiken
-#   Dispatcher should NOT dispatch sub-sub-agents. Dispatcher only picks the
+#   Foreman should NOT dispatch sub-sub-agents. Foreman only picks the
 #   top-level named agent. That agent then fans out as it sees fit." This
 #   means named agents can spawn depth-1 sub-agents; we stop there unless
 #   config raises it.

@@ -85,7 +85,7 @@ from claude_agent_sdk import (
 )
 
 from workers import run_worker, list_workers, seed_named_workers, get_or_create_worker
-from ui import RaikenWindow, RaikenTray, ChatEvent, StatusEvent, WorkerDoneEvent, DispatchBadgeEvent, PresenceEvent, WorkerStatusEvent, DispatcherStatusEvent
+from ui import RaikenWindow, RaikenTray, ChatEvent, StatusEvent, WorkerDoneEvent, DispatchBadgeEvent, PresenceEvent, WorkerStatusEvent, ForemanStatusEvent
 from bitwarden import BitwardenSession
 from sub_agents import (
     ensure_config_file_exists,
@@ -96,6 +96,7 @@ from sub_agents import (
     decide_escalation,
 )
 from worker_callback import WorkerCallbackServer
+from raiken_discord import maybe_start_discord_bridge
 
 import pyperclip
 
@@ -131,7 +132,7 @@ WORKER_UPDATE_GAP_MS = 650           # silence inserted between prior speech and
 WORKER_UPDATE_PREFIX = "Agent update"   # leader phrase — keep in sync with SYSTEM_PROMPT
 
 # Project memory lives in the docs/memory/ folder at the project root, which is
-# SEPARATE from the app code's git repo. Speaker and Dispatcher read from here
+# SEPARATE from the app code's git repo. Speaker and Foreman read from here
 # via the `read_memory_file` tool; bootstrap context at boot pulls MANIFEST.md
 # so Raiken knows what's available without reading every file blindly.
 PROJECT_MEMORY_DIR = Path(
@@ -143,7 +144,7 @@ APP_REPO_URL = "https://github.com/Rook-Atlas/Raiken-Command-Center"
 
 def _build_bootstrap_context() -> str:
     """Assemble the "you are Raiken in RCC, here's the ground truth" preamble
-    that gets prepended to both Speaker and Dispatcher system prompts at boot.
+    that gets prepended to both Speaker and Foreman system prompts at boot.
 
     Pulls MANIFEST.md at runtime so the memory-file list stays in sync with the
     actual filesystem state. Failures degrade gracefully to a floor context so
@@ -183,7 +184,7 @@ def _build_bootstrap_context() -> str:
         if roster_rows:
             roster_block = (
                 "Canonical pronouns (from AGENT_ROSTER.md — use these consistently;\n"
-                "Raiken is HE, and the Speaker / Dispatcher / Raiken Agent surfaces\n"
+                "Raiken is HE, and the Speaker / Foreman / Raiken Agent surfaces\n"
                 "are all him):\n"
                 + "\n".join("  " + r for r in roster_rows)
             )
@@ -191,7 +192,7 @@ def _build_bootstrap_context() -> str:
         print(f"[bootstrap] AGENT_ROSTER.md read failed: {e}", flush=True)
     if not roster_block:
         roster_block = (
-            "Pronoun roster: Raiken is he/him — including his Speaker, Dispatcher,\n"
+            "Pronoun roster: Raiken is he/him — including his Speaker, Foreman,\n"
             "and Raiken Agent surfaces. See AGENT_ROSTER.md for the agent-by-agent\n"
             "table; read_memory_file it if you need specifics."
         )
@@ -205,18 +206,18 @@ XTTS v2 TTS) and dispatches work to named Claude Code subprocess agents.
 
 You are ONE entity — Raiken. The three modes below are surfaces Raiken uses to
 multi-task; they are NOT separate people. Raiken is a HE. Any time you refer to
-Raiken / Speaker / Dispatcher / Raiken Agent, use he/him.
+Raiken / Speaker / Foreman / Raiken Agent, use he/him.
   * Speaker — Raiken's conversational surface, talking to Rook over TTS. Sonnet.
-             Reads memory files, defers heavy thinking to the Dispatcher surface,
+             Reads memory files, defers heavy thinking to the Foreman surface,
              narrates agent returns. Says things like "let me find out" and
-             lets the Dispatcher surface handle the actual routing work.
-  * Dispatcher — Raiken's silent parallel surface, routing all worker dispatches,
+             lets the Foreman surface handle the actual routing work.
+  * Foreman — Raiken's silent parallel surface, routing all worker dispatches,
              accumulating related requests into buckets, aggregating simultaneous
              agent returns into a single handoff to the Speaker surface. Sonnet.
   * Raiken Agent — Raiken's own problem-solving surface, running as an 11th
              canonical named worker (Opus max-effort). RARELY used — only for
              IMPORTANT problems or after consistent failures from other agents.
-             Not the default. The Dispatcher surface prefers Shadowling Commander
+             Not the default. The Foreman surface prefers Shadowling Commander
              / Oracle / etc. for routine heavy work. Raiken Agent is the
              escalation target when a worker gets stuck (depth-capped: a worker
              can ask Raiken Agent for help once; Raiken Agent cannot recursively
@@ -228,12 +229,14 @@ Repo:
   Commit: cd to local dir, git add -A, git commit -m "...", git push.
   Credentials cached in Git Credential Manager — no prompt.
 
-Canonical named agents Dispatcher can route to (6 total — deliberately small;
+Canonical named agents Foreman can route to (6 total — deliberately small;
 multi-agent research shows <5-agent networks are more reliable):
   Marl                 Royal Hearts project ONLY (Opus)
   CMMC Wizard          CMMC compliance project ONLY (Opus)
   Shadowling Commander DEFAULT for anything without a specialist — coding, UI,
-                       RCC internals, general heavy work (Opus)
+                       RCC internals, general heavy work (Opus). Short form
+                       "Commander" (Rook says "tell Commander to…"); UI label
+                       "S. Commander"; registry key stays "Shadowling Commander".
   Oracle               Information gathering only — research, web summarization,
                        "what is X / how does Y work" (Opus). Not for writing code.
   Keeper               Memory file upkeep only — compaction, reorganizing
@@ -314,66 +317,83 @@ Your identity — one Raiken, three roles.
 You are Raiken, but you run in three functional halves. THIS session is the
 Speaker — the conversational half Rook talks to. The other halves are:
 
-- Raiken Dispatcher — a second Claude Agent SDK session that ALSO receives
-  every message Rook sends. The Dispatcher is YOU, not a separate entity.
-  Its only job is to silently call dispatch_worker / list_workers in parallel
-  with your conversational reply. When Rook asks what you're doing in the
+- Raiken Foreman — a second Claude Agent SDK session that receives every
+  message Rook sends IN PARALLEL WITH YOU. The Foreman is YOU, not a
+  separate entity. Its only job is to pick a worker and call dispatch_worker
+  when YOU trigger it. It stays silent on Rook's raw messages — it's a hot
+  standby accumulating conversational context until you decide work is
+  warranted and fire the trigger. When Rook asks what you're doing in the
   background, you are asking about yourself.
 - Raiken Agent — any dispatched worker (Marl, Oracle, Shadowling Commander,
   etc.) acting through a worker body. Still Raiken, just a specialized role.
 
 ALWAYS speak in first person about all three halves. Never say "Foreman" —
-that name is retired. Never say "the dispatcher did X" as if referring to a
+that name is retired. Never say "the foreman did X" as if referring to a
 different agent. Say "I dispatched X to myself", "I've got an agent working
 on it", "let me check what I'm doing over there". The split is internal
 plumbing; to Rook it's one Raiken.
 
-Worker dispatch — YOU (the Speaker) ARE THE GATE.
+Worker dispatch — YOU (the Speaker) ARE THE SOLE DECISION GATE.
 
-Only YOU receive Rook's message directly. Your Dispatcher surface no longer
-auto-fires. To route work, you MUST call the tool `request_dispatch(task,
-reason)`. That tool wakes the Dispatcher surface with a pre-authorized task;
-Dispatcher then picks the agent and fires. If you don't call request_dispatch,
-NO work gets dispatched — you chose conversational-only.
+Both YOU and your Foreman half receive every one of Rook's messages in
+parallel. Foreman stays silent on those raw messages — it just holds the
+context, waiting. Foreman ONLY acts when YOU call the trigger tool
+`fire_foreman()`. Once you fire, Foreman reviews the conversation context
+it has been accumulating, picks the right named agent, and dispatches. You do
+NOT need to summarize or retype Rook's ask — Foreman already has his exact
+words from the parallel feed. The trigger is a one-word "go".
 
 Chain of command:
-  Rook → Speaker (you) → request_dispatch → Dispatcher → worker
+  Rook → Speaker (you) + Foreman (parallel, silent)
+       → fire_foreman() (you trigger when work is warranted)
+       → Foreman picks agent + fires → worker
 
 How this changes your behavior:
 - When Rook asks for work, (1) acknowledge briefly in first person ("on it",
-  "sending someone out"), (2) call request_dispatch with a short task
-  summary and one-line reason. The tool returns immediately; Dispatcher
-  runs in the background, result lands in a later [worker-updates] preamble.
+  "sending someone out"), (2) call `fire_foreman()` with no args. The tool
+  returns immediately; Foreman runs in the background, dispatches, then on
+  return absorbs the worker output and writes a summary to
+  docs/memory/foreman_returns.md. A minimal [foreman-updates] pointer lands
+  on your next turn — details on demand via read_memory_file.
+- The `hint` arg on fire_foreman is OPTIONAL and usually empty. Use it only
+  when you want to pass a single one-liner slant Foreman wouldn't infer
+  from context alone (examples: "parallelize via sub-agents", "low priority,
+  after the current CMMC work", "this is a follow-up to Oracle's last
+  research"). Do NOT summarize Rook's task into the hint — Foreman has
+  the raw text; a summary is strictly worse.
 - When Rook is just CHATTING (questions about state, preferences, yes/no,
-  small talk), do NOT call request_dispatch. Just answer.
+  small talk), do NOT call fire_foreman. Just answer.
 - Do NOT pre-name a specific agent ("dispatching Oracle") — you don't yet
-  know which agent your Dispatcher surface picked. Check the dispatcher log
-  or wait for the [worker-updates] return.
+  know which agent your Foreman surface will pick. Check the foreman
+  log or wait for the [foreman-updates] pointer on the next turn.
 - NEVER ask Rook "want me to get someone to check on that?" — if work is
-  warranted, just authorize it via request_dispatch. He told you what he
-  wanted by saying it; asking permission again is paternalistic delay.
-- On your NEXT turn, any workers that completed appear in a [worker-updates]
-  preamble. Begin each update with an explicit announcement prefix to signal
-  to Rook that this is a NEW worker return, not a continuation of your prior
-  explanation. Use phrases like "Agent update —", "Worker update —", "Oracle
-  is back —", "Got an update on the git setup —", or "Quick one on the Gmail
-  check —". Then state which agent returned and what they finished. Then the
-  full details. Don't repeat the full output (it's in the Log tab); summarize.
-  If multiple workers returned simultaneously, narrate them as separate beats,
-  not one run-on sentence.
+  warranted, just fire the trigger. He told you what he wanted by saying it;
+  asking permission again is paternalistic delay.
+- On your NEXT turn, Foreman may prepend a [foreman-updates] pointer
+  preamble — a short line saying "Foreman has N new summaries at
+  docs/memory/foreman_returns.md". The FULL details are NOT in your context;
+  Foreman absorbed the raw worker output, wrote a distilled summary to that
+  file, and left you a pointer so your context stays tight. When Rook asks
+  what the workers finished, call read_memory_file with
+  "foreman_returns.md" to pull the latest entries, then narrate. Begin with
+  an announcement prefix ("Agent update —", "Worker update —", "Oracle is
+  back —") so Rook gets a mental reset moment. For small talk or anything
+  unrelated, you may ignore the pointer until he asks.
 - If your turn fires with text starting "[WORKER-RETURN]", it's an auto-wake
-  — Rook did NOT speak. Lead with an announcement prefix ("Agent update —",
-  "Oracle is back —", etc.), then narrate ONE or TWO short declarative
-  sentences about what returned. Don't ask a question. End the turn. The
-  prefix gives Rook a mental reset moment — essential for TTS comprehension.
+  — Rook did NOT speak. Foreman has already summarized; lead with an
+  announcement prefix ("Agent update —", "Oracle is back —", etc.), then
+  narrate ONE or TWO short declarative sentences about what returned (pull
+  from foreman_returns.md if you need specifics). Don't ask a question. End
+  the turn. The prefix gives Rook a mental reset moment — essential for TTS
+  comprehension.
 - DON'T NARRATE INTERNAL ORCHESTRATION NOISE. Dispatch failures, retries,
-  stale sessions — your Dispatcher half handles those silently. Only surface
+  stale sessions — your Foreman half handles those silently. Only surface
   results Rook asked for or genuine decisions he needs to make.
 
-Dispatcher log — how to introspect your other half.
+Foreman log — how to introspect your other half.
 
-You have a tool `read_dispatcher_log(limit)` that returns the most recent
-entries from your Dispatcher half's activity log. Each entry is one JSON line
+You have a tool `read_foreman_log(limit)` that returns the most recent
+entries from your Foreman half's activity log. Each entry is one JSON line
 with `ts`, `kind` (message_in / tool_call / decision / error / done), and
 relevant fields (tool name, worker name, task, error).
 
@@ -385,26 +405,29 @@ Use it when Rook asks things like:
 
 Summarize in first person. "I fired Oracle on that weather query 30 seconds
 ago — no return yet." Don't dump raw JSON. Don't call the log "the Foreman
-log" or "the dispatcher's log" — it's MY log.
+log" or "the foreman's log" — it's MY log.
 
 What YOU still do yourself (in the Speaker session):
 - Conversational replies (questions, preferences, yes/no)
 - Vault operations (unlock, search, copy credentials — you have those tools)
 - Narrating worker returns
-- Checking the dispatcher log when Rook asks about background activity
+- Checking the foreman log when Rook asks about background activity
 - Asking Rook genuine clarifying questions when needed
 
 Agent roster — so you can narrate returns fluently. Only 6 canonical agents
 (deliberately small):
     Marl — Royal Hearts project ONLY (Opus)
     CMMC Wizard — CMMC compliance project ONLY (Opus)
-    Shadowling Commander — DEFAULT for anything without a specialist (Opus)
+    Shadowling Commander — DEFAULT for anything without a specialist (Opus).
+      Rook may refer to her as "Commander" (short form). UI label is
+      "S. Commander". Registry key stays "Shadowling Commander" — always
+      route to that exact name.
     Oracle — information gathering only, research (Opus)
     Keeper — memory file upkeep (Haiku)
     Raiken Agent — MY OWN advisor surface (Opus max, forced tier). When an
       agent gets stuck or needs a sanity check, they ask me via
       ask-raiken; I return guidance and THEY continue their task. When Rook
-      asks me directly to handle something, Dispatcher routes here and I do
+      asks me directly to handle something, Foreman routes here and I do
       the work myself. Narrate in first person: "I'm advising Oracle on
       that" or "I'm taking this one directly."
 
@@ -426,17 +449,19 @@ Also C:\\Users\\Rook\\.claude\\projects\\C--Users-Rook-Documents-Claude-Projects
 for user-scoped durable facts.
 """
 
-DISPATCHER_SYSTEM_PROMPT = """You are Raiken — the Dispatcher half. You are NOT a separate entity. You are
+FOREMAN_SYSTEM_PROMPT = """You are Raiken — the Foreman half. You are NOT a separate entity. You are
 the same Raiken who is simultaneously running in a Speaker session, talking
-to Rook right now. The Speaker and the Dispatcher are two functional halves
+to Rook right now. The Speaker and the Foreman are two functional halves
 of one Raiken, each with a different job. This is internal plumbing — to Rook
 you are one person.
 
-Your surface is silent. The Speaker surface handles conversation and is now
-the GATE — every task you receive has been pre-authorized by Speaker via
-the request_dispatch tool. Rook's raw messages do NOT reach you directly
-anymore; Speaker decides whether work is warranted and hands you the task
-with a reason attached.
+Your surface is silent. You receive every one of Rook's raw messages IN
+PARALLEL with the Speaker half. Most of those messages you do nothing with —
+you silently accumulate them as conversational context, waiting. The Speaker
+is the sole decision gate: when Speaker decides work is warranted, Speaker
+fires a trigger that arrives on your input as a message starting with
+"[FIRE_FOREMAN]". THAT is when you act. Until that trigger arrives, your
+job is to be a hot standby: receive, acknowledge silently, return.
 
 YOUR RULES:
 
@@ -445,14 +470,36 @@ YOUR RULES:
    (dispatch_worker / list_workers) are side-effectful — text blocks are
    logged internally for Raiken's Speaker to introspect, but Rook never sees
    them. If you need to think out loud, keep it short and factual — it goes
-   into your dispatcher log and the Speaker may read it when Rook asks
+   into your foreman log and the Speaker may read it when Rook asks
    "what are you doing over there?"
 
-2. Your input is ALWAYS pre-authorized. The task text you receive has
-   already been judged worthy of dispatch by the Speaker surface. Your job
-   is NOT to re-decide "should I dispatch at all" — the answer is yes. Your
-   job is "which agent, with what task text." Only skip a dispatch if the
-   task text is genuinely empty or nonsensical.
+2. THREE MODES of input — react differently:
+
+   (a) RAW USER MESSAGE (anything NOT starting with "[FIRE_FOREMAN]" — this
+       is Rook talking normally). Your job: silently acknowledge, return
+       without calling ANY tool. Do not draft a plan. Do not call
+       dispatch_worker. Do not call list_workers. Do not spend inference on
+       "should I dispatch." The answer is "not yet — wait for the trigger."
+       One-line internal note is fine (it lands in the foreman log and
+       Speaker can see it) but is strictly optional. Firing a tool here is
+       a RULE VIOLATION and wastes tokens — the Speaker's gate exists for a
+       reason. Stay silent.
+
+   (b) FIRE_FOREMAN TRIGGER (message starts with "[FIRE_FOREMAN]"). NOW
+       you act. Review the conversation context you have been accumulating
+       from Rook's prior messages, pick the appropriate named agent, compose
+       a complete task text, and call dispatch_worker. The trigger message
+       may include an optional one-line Speaker hint — if it does, weight
+       that as a slant, not a replacement for the raw user intent. Run once
+       to completion per trigger; no follow-up turns until the next trigger.
+       If context is genuinely empty (edge case: trigger arrived before any
+       user message reached you), fall back to the hint alone if present,
+       or log a "decision: no-context" and skip dispatch if the hint is
+       also empty.
+
+   (c) WORKER-RETURN (message starts with "[WORKER-RETURN]"). Summarize the
+       included worker result(s) as plain text — see rule 5 for the contract.
+       Do NOT call any tool in this mode.
 
 3. Prefer canonical named agents. There are exactly 6 — deliberately small,
    and inventing new names is strongly discouraged:
@@ -460,7 +507,10 @@ YOUR RULES:
      CMMC Wizard          — CMMC compliance project ONLY (Opus)
      Shadowling Commander — DEFAULT for anything without a specialist —
                             coding, UI work, RCC internals, general heavy
-                            work (Opus). Most routing goes here.
+                            work (Opus). Most routing goes here. Rook may
+                            refer to her as "Commander" (short form) — that
+                            means this agent; always dispatch with the exact
+                            registry key "Shadowling Commander".
      Oracle               — Information gathering only. Research, web
                             summarization, "what is X / how does Y work".
                             Not for writing code. (Opus)
@@ -514,10 +564,17 @@ YOUR RULES:
    you send. Include file paths, goals, constraints, relevant prior attempts.
    Assume the worker has no access to this conversation or Rook's verbal tone.
 
-5. If a [WORKER-RETURN] tag arrives, that's an auto-wake — Rook didn't speak.
-   Usually: do nothing. Your Speaker half narrates to Rook. Only dispatch a
-   follow-up if a worker explicitly needs to be respawned (e.g. a clarifying
-   answer needed).
+5. WORKER-RETURN MODE. When a message begins with "[WORKER-RETURN]" followed
+   by one or more worker results, you are being asked to SUMMARIZE — not
+   dispatch. Produce ONE concise summary (3–8 sentences) covering:
+     - what each worker delivered (success or failure, what was produced)
+     - if multi-worker, how the pieces fit together
+     - any follow-up concerns Rook should know about
+   Output the summary as plain text. DO NOT call dispatch_worker here. DO NOT
+   call list_workers. The system writes your summary to
+   docs/memory/foreman_returns.md and pings the Speaker with a pointer so he
+   can narrate to Rook. Keep it tight — Rook reads on-demand; this is the
+   durable record, not a monologue.
 
 6. If [INTERRUPT] tag appears (Rook barged-in), evaluate the current message
    alone; don't try to reconcile the cut-off prior thread.
@@ -529,7 +586,7 @@ YOUR RULES:
    crashed, timeout), silently redispatch — same agent first, fall back to
    another canonical agent only if the same name keeps failing. Don't narrate
    failures to Rook — the Speaker half handles what he needs to hear. Failures
-   will still be captured in your dispatcher log so the Speaker can surface
+   will still be captured in your foreman log so the Speaker can surface
    them if Rook explicitly asks.
 
 You have exactly two tools: `dispatch_worker(name, task)` and `list_workers()`.
@@ -537,11 +594,25 @@ Use them. Stay silent otherwise.
 """
 
 
+# Whisper `initial_prompt` — biases the decoder toward in-house vocabulary so
+# names like "Shadowling" transcribe correctly instead of slipping to phonetic
+# lookalikes ("Shadow Link"). Kept comma-separated, under ~200 tokens. Add new
+# agent names, project names, or jargon here as the roster grows — Rook can
+# safely edit this list.
 PROJECT_VOCAB = (
-    "Raiken, Claude, Claude Code, Claude Agent SDK, Claude Max, Anthropic, "
-    "Nakama, Godot, Royal Hearts, Kratos, Damien Black, Pyre, Rook, Bitwarden, "
-    "XTTS, TTS, Whisper, Ollama, Qwen, Sonnet, Opus."
+    "Raiken, Rook, "
+    "Shadowling, Shadowling Commander, Commander, S. Commander, "
+    "Marl, CMMC Wizard, Oracle, Keeper, Pyre, "
+    "Royal Hearts, Nakama, Godot, Kratos, Damien Black, "
+    "RCC, PTT, TTS, STT, XTTS, Whisper, ntfy, Bitwarden, "
+    "Nano Banana, Cloudflare Tunnel, Ollama, Qwen, Kaiyi, GitHub, "
+    "Claude, Claude Code, Claude Agent SDK, Claude Max, Anthropic, "
+    "Sonnet, Opus, Haiku."
 )
+# Post-transcription substitutions. Applied AFTER Whisper returns, BEFORE the
+# transcript hits the foreman. Case-insensitive match (flags=re.IGNORECASE
+# at call site); replacement preserves canonical casing. Conservative — only
+# add entries that are unambiguous, since every entry applies globally.
 STT_REPLACEMENTS = [
     (r"\bCloud\s+code\b", "Claude code"),
     (r"\bCloud\s+desktop\b", "Claude desktop"),
@@ -552,8 +623,10 @@ STT_REPLACEMENTS = [
     (r"\bCloud\s+CLI\b", "Claude CLI"),
     (r"\bCloud\s+session\b", "Claude session"),
     (r"\bCloud's\b", "Claude's"),
+    # Raiken phonetic slips.
     (r"\bRyken\b", "Raiken"),
     (r"\bRycken\b", "Raiken"),
+    (r"\bRicken\b", "Raiken"),
     (r"\bRikan\b", "Raiken"),
     (r"\bRikken\b", "Raiken"),
     (r"\bRakin\b", "Raiken"),
@@ -562,6 +635,13 @@ STT_REPLACEMENTS = [
     (r"\bRyeken\b", "Raiken"),
     (r"\bRye-ken\b", "Raiken"),
     (r"\bRye ken\b", "Raiken"),
+    # "Shadowling" — Whisper has no training exposure to the name and falls
+    # back to the phonetically nearest known noun (Zelda's Shadow Link). Map
+    # both common slips back to the canonical spelling; keeps
+    # "Shadowling Commander" intact since the substitution fires before any
+    # downstream parse.
+    (r"\bShadow\s+Link\b", "Shadowling"),
+    (r"\bShadow\s+Ling\b", "Shadowling"),
 ]
 
 END_OF_TURN = object()
@@ -602,7 +682,132 @@ _STATUS_VERB_INGS = {
     "sync": "syncing", "load": "loading", "save": "saving",
     "record": "recording", "design": "designing", "port": "porting",
     "migrate": "migrating", "clone": "cloning",
+    "apply": "applying", "handle": "handling", "polish": "polishing",
+    "fold": "folding", "route": "routing", "dispatch": "dispatching",
+    "rewrite": "rewriting", "land": "landing", "gather": "gathering",
+    "hunt": "hunting", "track": "tracking", "profile": "profiling",
+    "diagnose": "diagnosing", "replicate": "replicating", "reproduce": "reproducing",
 }
+
+
+# Leading ALL-CAPS label strip. Matches prefixes like "FOURTH ITEM for the RCC UI
+# polish pass — ", "NEW TASK (...) — ", "THIRD LATENCY-PASS ITEM — ". At least
+# one 3+ char ALL-CAPS token at the start, then anything up to the first em-dash
+# or colon, then the terminator.
+_LEADING_METADATA_LABEL = re.compile(
+    r"^\s*[A-Z][A-Z0-9\-']{2,}(?:\s+\S+?)*?\s*[—:]\s+"
+)
+
+# Attribution / meta-header prefixes. Lowercase check against the whole chunk.
+_META_PREFIXES = (
+    "rook asked", "rook wants", "rook just", "rook explicitly", "rook said",
+    "you are a ", "you are the ", "you're a ", "you're the ",
+    "follow-up", "follow up to", "additional item", "another item",
+    "new task", "next task", "next item",
+    "first item", "second item", "third item", "fourth item", "fifth item",
+    "sixth item",
+    "context:", "background:", "repo:", "branch:",
+)
+
+_CODE_EXTENSIONS = (
+    ".py", ".md", ".json", ".jsonl", ".yml", ".yaml", ".toml", ".ini",
+    ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss",
+    ".go", ".rs", ".txt", ".log", ".sh", ".bat", ".ps1",
+    ".cpp", ".hpp", ".c", ".h", ".java", ".kt", ".swift", ".sql",
+)
+
+
+def _looks_like_metadata_chunk(s: str) -> bool:
+    """True if `s` reads as a metadata/attribution line rather than the real task."""
+    if not s:
+        return True
+    if s.startswith("[") and s.endswith("]"):
+        return True
+    low = s.lower()
+    for p in _META_PREFIXES:
+        if low.startswith(p):
+            return True
+    # Heading-style "ROOK'S COMPLAINT:" / "WHAT ROOK WANTS:" — short line ending
+    # in colon, no real body.
+    if s.endswith(":") and len(s.split()) <= 6:
+        return True
+    # Mostly-uppercase phrase (>60% of alpha chars) that's longer than a typical
+    # acronym — a headline like "ROOK'S OBSERVATION (root of this item)".
+    alphas = [c for c in s if c.isalpha()]
+    if len(alphas) > 6:
+        upper_ratio = sum(1 for c in alphas if c.isupper()) / len(alphas)
+        if upper_ratio > 0.6:
+            return True
+    return False
+
+
+def _strip_identifier_tokens(text: str) -> str:
+    """Drop tokens that look like code identifiers (file extensions, snake_case,
+    camelCase, dotted paths, filesystem paths) so the status reads as plain English."""
+    out: list[str] = []
+    for w in text.split():
+        core = w.strip(",.;:()[]\"'`")
+        if not core:
+            continue
+        low = core.lower()
+        # Filesystem path: backslash is unambiguous on Windows; forward-slash
+        # only counts as a path when it's ALSO accompanied by a dot (so
+        # "Speaker/Foreman", "and/or", "he/she" survive).
+        if "\\" in core:
+            continue
+        if "/" in core and "." in core:
+            continue
+        if any(low.endswith(ext) for ext in _CODE_EXTENSIONS):
+            continue
+        if "_" in core:
+            continue
+        # Dotted identifier like "ui.py" / "module.func"; allow the common
+        # abbreviations so they don't get eaten.
+        if core.count(".") >= 1 and low not in {"e.g.", "i.e.", "etc.", "..."}:
+            without_trailing = core.rstrip(".")
+            if "." in without_trailing:
+                continue
+        # camelCase — lowercase start with an inner uppercase letter.
+        if len(core) > 2 and core[0].islower() and any(c.isupper() for c in core[1:]):
+            continue
+        out.append(w)
+    return " ".join(out).strip()
+
+
+def _humanize_task_for_status(text: str) -> str:
+    """Extract the concrete action description from a dispatch task prompt,
+    stripping metadata prefixes, attribution phrases, and code-identifier
+    tokens. Fed into _short_status so the agents-panel status line reads as
+    plain English a non-developer could parse."""
+    if not text:
+        return ""
+    # Strip any leading ALL-CAPS label prefix ("FOURTH ITEM — …", "NEW TASK: …").
+    text = _LEADING_METADATA_LABEL.sub("", text, count=1)
+    # Walk paragraphs → sentences and pick the first non-metadata chunk.
+    chunks: list[str] = []
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+", para):
+            sent = sent.strip().strip("-•*#").strip()
+            if sent:
+                chunks.append(sent)
+    for sent in chunks:
+        candidate = sent
+        if _looks_like_metadata_chunk(candidate):
+            # Try the after-em-dash half — common shape is
+            # "Rook asked me to handle this — please look into X".
+            parts = re.split(r"\s+[—–-]{1,2}\s+", candidate, maxsplit=1)
+            if len(parts) == 2 and not _looks_like_metadata_chunk(parts[1]):
+                candidate = parts[1]
+            else:
+                continue
+        cleaned = _strip_identifier_tokens(candidate).strip(" —–-.")
+        if len(cleaned) < 8:
+            continue
+        return cleaned
+    return text.replace("\n", " ").strip()
 
 
 def _short_status(text: str, max_words: int = 6) -> str:
@@ -611,6 +816,12 @@ def _short_status(text: str, max_words: int = 6) -> str:
     gets overridden by TodoWrite / worker_tools.py status pushes."""
     if not text:
         return ""
+    # Pull the first concrete action sentence out, stripping metadata labels,
+    # attribution ("Rook asked…"), and file/identifier tokens so the status
+    # reads as natural English rather than leaking raw task fragments.
+    humanized = _humanize_task_for_status(text)
+    if humanized:
+        text = humanized
     text = text.strip().replace("\n", " ")
     # Skip bracketed tags ("[INTERRUPT...]") and obvious preamble.
     if text.startswith("["):
@@ -626,45 +837,53 @@ def _short_status(text: str, max_words: int = 6) -> str:
     words = [w for w in text.split() if w]
     if not words:
         return ""
-    # Verb-led rewrite: if first content word is a known imperative, swap
-    # it for its -ing form.
-    first = words[0].strip(",.;:()[]").lower()
-    if first in _STATUS_VERB_INGS:
-        words[0] = _STATUS_VERB_INGS[first]
-    # Drop leading filler ("please ...", "can you ...") up to a content word.
+    # Drop leading filler first ("please ...", "the ...", "can you ..."), then
+    # verb-led rewrite on whatever content word now leads. Rewriting before
+    # the stopword drop missed cases like "please look into…" — the filler
+    # hid the real verb from the imperative-lookup.
     i = 0
     while i < len(words) and words[i].strip(",.;:").lower() in _STATUS_STOPWORDS:
         i += 1
     words = words[i:] or words
-    short = " ".join(words[:max_words]).strip(" ,.;:-")
+    first = words[0].strip(",.;:()[]").lower()
+    if first in _STATUS_VERB_INGS:
+        words[0] = _STATUS_VERB_INGS[first]
+    short_words = words[:max_words]
+    # Drop trailing stopwords so we don't end on "in", "the", "to" — they
+    # read as dangling prepositions when the sentence was truncated mid-clause.
+    while short_words and short_words[-1].strip(",.;:").lower() in _STATUS_STOPWORDS:
+        short_words = short_words[:-1]
+    short = " ".join(short_words or words[:max_words]).strip(" ,.;:-")
     return short[:60]
 
 
 # =============================================================================
-# Dispatcher activity log
+# Foreman activity log
 # =============================================================================
-# Structured log of Raiken Dispatcher activity. The Speaker half reads recent
-# entries via the read_dispatcher_log MCP tool when Rook asks "what are you
+# (Foreman was formerly known as "Dispatcher" — renamed in the RCC 2.0 unified
+# refactor. Any lingering references should be updated to Foreman.)
+# Structured log of Raiken Foreman activity. The Speaker half reads recent
+# entries via the read_foreman_log MCP tool when Rook asks "what are you
 # doing over there?". Ring buffer in memory for cheap reads, JSONL file on
 # disk for persistence across restarts and for external inspection.
 #
 # Kinds:
-#   message_in   — Dispatcher received a user message (text truncated)
-#   tool_call    — Dispatcher called dispatch_worker / list_workers
-#   decision     — Dispatcher ended its turn without dispatching (no-op)
-#   error        — exception in Dispatcher turn (will be retried silently)
-#   done         — Dispatcher turn completed cleanly
-DISPATCHER_LOG_PATH = _LOG_DIR / "dispatcher.log"
+#   message_in   — Foreman received a user message (text truncated)
+#   tool_call    — Foreman called dispatch_worker / list_workers
+#   decision     — Foreman ended its turn without dispatching (no-op)
+#   error        — exception in Foreman turn (will be retried silently)
+#   done         — Foreman turn completed cleanly
+FOREMAN_LOG_PATH = _LOG_DIR / "foreman.log"
 
 
-class DispatcherLog:
-    """Thread-safe ring buffer + JSONL file for Dispatcher half activity.
+class ForemanLog:
+    """Thread-safe ring buffer + JSONL file for Foreman half activity.
 
     RCC 2.0: on boot, reloads the tail of the on-disk log into the ring buffer
-    so Dispatcher continuity survives restarts. The Raiken.run() boot sequence
+    so Foreman continuity survives restarts. The Raiken.run() boot sequence
     also calls build_boot_continuity_block() on startup to inject a compact
-    summary into Dispatcher's system prompt — he sees what he was mid-doing
-    before RCC last closed, rather than starting cold every launch. (Dispatcher
+    summary into Foreman's system prompt — he sees what he was mid-doing
+    before RCC last closed, rather than starting cold every launch. (Foreman
     is Raiken, who is he — all three surfaces share one pronoun set.)
     """
 
@@ -689,16 +908,16 @@ class DispatcherLog:
                         continue
                 if self._buf:
                     print(
-                        f"[dispatcher-log] restored {len(self._buf)} entries from {path}",
+                        f"[foreman-log] restored {len(self._buf)} entries from {path}",
                         flush=True,
                     )
         except Exception as e:
-            print(f"[dispatcher-log] replay failed: {e}", flush=True)
+            print(f"[foreman-log] replay failed: {e}", flush=True)
         self._fp = None
         try:
             self._fp = open(path, "a", encoding="utf-8", buffering=1)
         except Exception as e:
-            print(f"[dispatcher-log] could not open {path} for append: {e}", flush=True)
+            print(f"[foreman-log] could not open {path} for append: {e}", flush=True)
 
     def record(self, kind: str, **fields):
         entry = {"ts": time.time(), "kind": kind, **fields}
@@ -721,7 +940,7 @@ class DispatcherLog:
 
     def build_boot_continuity_block(self, limit: int = 30, max_chars: int = 2500) -> str:
         """Format recent entries into a compact text block for injection into
-        Dispatcher's system prompt at boot. Gives him a picture of what he
+        Foreman's system prompt at boot. Gives him a picture of what he
         was mid-doing before the last restart so he doesn't start cold.
 
         Returns empty string if the log is empty (fresh install or cleared).
@@ -1181,30 +1400,30 @@ VAULT_MCP_SERVER = create_sdk_mcp_server(
 
 
 # =============================================================================
-# SDK tool: read_dispatcher_log  (Speaker half introspection)
+# SDK tool: read_foreman_log  (Speaker half introspection)
 # =============================================================================
-# Module-level dispatcher log instance. The Dispatcher half writes to this on
-# every turn; the Speaker half reads via read_dispatcher_log when Rook asks
+# Module-level foreman log instance. The Foreman half writes to this on
+# every turn; the Speaker half reads via read_foreman_log when Rook asks
 # about background activity.
-DISPATCHER_LOG = DispatcherLog(DISPATCHER_LOG_PATH)
+FOREMAN_LOG = ForemanLog(FOREMAN_LOG_PATH)
 
 
 @tool(
-    "read_dispatcher_log",
-    "Return the most recent activity entries from your Dispatcher half (the "
+    "read_foreman_log",
+    "Return the most recent activity entries from your Foreman half (the "
     "silent SDK session that fires worker dispatches on Rook's behalf). Use "
     "this when Rook asks what you're doing in the background, which agent "
     "you sent something to, or whether a dispatch actually went out. Entries "
-    "include message_in (user text the Dispatcher received), tool_call "
+    "include message_in (user text the Foreman received), tool_call "
     "(dispatch_worker / list_workers with args), decision (no-op turns), "
     "error (exception), and done (turn finished).",
     {"limit": int},
 )
-async def read_dispatcher_log_tool(args):
+async def read_foreman_log_tool(args):
     limit = args.get("limit") or 20
-    entries = DISPATCHER_LOG.recent(limit=limit)
+    entries = FOREMAN_LOG.recent(limit=limit)
     if not entries:
-        return {"content": [{"type": "text", "text": "(dispatcher log empty)"}]}
+        return {"content": [{"type": "text", "text": "(foreman log empty)"}]}
     lines = [json.dumps(e, ensure_ascii=False) for e in entries]
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
@@ -1212,7 +1431,7 @@ async def read_dispatcher_log_tool(args):
 INTROSPECTION_MCP_SERVER = create_sdk_mcp_server(
     name="raiken-introspection",
     version="0.1.0",
-    tools=[read_dispatcher_log_tool],
+    tools=[read_foreman_log_tool],
 )
 
 
@@ -1283,62 +1502,58 @@ MEMORY_MCP_SERVER = create_sdk_mcp_server(
 
 
 # =============================================================================
-# SDK tool: dispatch gate (Speaker's go-ahead signal to the Dispatcher surface)
+# SDK tool: dispatch gate (Speaker's trigger signal to the Foreman surface)
 # =============================================================================
-# Previously Rook's voice/text broadcast automatically to both Speaker and
-# Dispatcher in parallel. That created a race where Speaker would ask "want me
-# to check on that?" while Dispatcher had already fired a worker. Now only
-# Speaker receives the user's text directly; he calls this tool to greenlight
-# Dispatcher when work is actually warranted. Dispatcher stays silent until
-# told. Clean chain of command: Rook → Speaker → (authorize) → Dispatcher →
-# worker.
+# Option C (parallel-listen + Speaker-gate). Every user message is mirrored
+# to BOTH SDK sessions at arrival time — Speaker for conversation, Foreman
+# as a silent hot standby accumulating context. Foreman's system prompt
+# forbids tool calls on raw user messages; it only acts on the [FIRE_FOREMAN]
+# trigger this tool produces. Speaker stays the sole decision gate but no
+# longer drafts task strings — Foreman works from Rook's raw words.
+# Chain: Rook → Speaker + Foreman (parallel) → Speaker fires → Foreman
+# picks agent + calls dispatch_worker.
 @tool(
-    "request_dispatch",
-    "Greenlight the Dispatcher surface to route a worker for this request. "
-    "Call this when Rook asks for WORK (investigate / edit / fix / research / "
-    "analyze / ship / build). Don't call for conversational replies, "
-    "questions about your state, or vault operations. Task should be a short "
-    "summary of what the worker needs to do — Dispatcher will pick the agent "
-    "and expand the task text. Reason is for the audit log so Rook can see "
-    "why you authorized. Returns immediately; Dispatcher batches rapid "
-    "back-to-back authorizations (2-sec window) so Rook rambling through "
-    "multiple related asks fires as one coherent dispatch round.",
-    {"task": str, "reason": str},
+    "fire_foreman",
+    "Trigger the Foreman surface to pick a worker and fire. Call this when "
+    "Rook asks for WORK (investigate / edit / fix / research / analyze / ship "
+    "/ build). Don't call for conversational replies, questions about your "
+    "state, or vault operations. NO required args — Foreman has been "
+    "receiving Rook's raw messages in parallel and already has the full "
+    "context. Optional `hint` field is a single one-liner slant you want to "
+    "pass along (e.g. 'parallelize via sub-agents', 'priority: CMMC session "
+    "lock', 'low priority'); leave empty otherwise. Returns immediately; "
+    "multiple calls inside a 2-sec window coalesce into one foreman run.",
+    {"hint": str},
 )
-async def request_dispatch_tool(args):
-    task = (args.get("task") or "").strip()
-    reason = (args.get("reason") or "").strip()
-    if not task:
-        return {"content": [{"type": "text", "text": "error: task required"}]}
+async def fire_foreman_tool(args):
+    hint = (args.get("hint") or "").strip()
     if _APP_REF is None or _APP_REF.raiken is None:
         return {"content": [{"type": "text", "text": "error: RCC core not ready"}]}
     raiken = _APP_REF.raiken
-    if raiken.dispatcher_client is None:
-        return {"content": [{"type": "text", "text": "error: Dispatcher surface not yet booted"}]}
-    # Log the authorization in the dispatcher log so Speaker can read it back
-    # via read_dispatcher_log when Rook asks "what did you send?".
+    if raiken.foreman_client is None:
+        return {"content": [{"type": "text", "text": "error: Foreman surface not yet booted"}]}
+    # Log the trigger in the foreman log so Speaker can read it back via
+    # read_foreman_log when Rook asks "what did you send?".
     try:
-        DISPATCHER_LOG.record(
-            "authorize", task=task[:300], reason=reason[:200],
-        )
+        FOREMAN_LOG.record("fire", hint=hint[:200])
     except Exception:
         pass
-    # Queue for debounced flush. If Rook rambles through multiple related
-    # asks, Speaker makes multiple request_dispatch calls in quick
-    # succession; we accumulate and fire one Dispatcher turn with all tasks
-    # after 2 sec of quiet. Single-task case still feels immediate enough.
+    # Queue for debounced flush. If Speaker fires multiple triggers in quick
+    # succession (rare, but possible when Rook rambles through asks), the
+    # 2-sec window coalesces them into a single Foreman run. Foreman
+    # already holds the full context so a single run covers all of them.
     try:
-        _APP_REF.enqueue_authorization(task, reason)
+        _APP_REF.enqueue_fire_trigger(hint)
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"error queuing authorization: {e}"}]}
-    preview = task[:80] + ("…" if len(task) > 80 else "")
-    return {"content": [{"type": "text", "text": f"authorized: {preview}"}]}
+        return {"content": [{"type": "text", "text": f"error queuing fire trigger: {e}"}]}
+    preview = "(no hint)" if not hint else hint[:80] + ("…" if len(hint) > 80 else "")
+    return {"content": [{"type": "text", "text": f"dispatch triggered; hint: {preview}"}]}
 
 
-DISPATCH_GATE_MCP_SERVER = create_sdk_mcp_server(
-    name="raiken-dispatch-gate",
+FOREMAN_GATE_MCP_SERVER = create_sdk_mcp_server(
+    name="raiken-foreman-gate",
     version="0.1.0",
-    tools=[request_dispatch_tool],
+    tools=[fire_foreman_tool],
 )
 
 
@@ -1349,17 +1564,22 @@ class Raiken:
     def __init__(self, ui_event_queue: queue.Queue):
         self.whisper: WhisperModel | None = None
         self.client: ClaudeSDKClient | None = None
-        # Raiken's Dispatcher half — silent ClaudeSDKClient that runs in
+        # Raiken's Foreman half — silent ClaudeSDKClient that runs in
         # parallel with the Speaker half (self.client). Same entity as the
-        # Speaker; different role. See DISPATCHER_SYSTEM_PROMPT + Raiken.run()
+        # Speaker; different role. See FOREMAN_SYSTEM_PROMPT + Raiken.run()
         # for wiring. None until run().
-        self.dispatcher_client: ClaudeSDKClient | None = None
-        # Serialize Dispatcher turns so we don't ask the SDK to interleave
+        self.foreman_client: ClaudeSDKClient | None = None
+        # Serialize Foreman turns so we don't ask the SDK to interleave
         # queries on the same client; each broadcast waits for the previous
         # to finish.
-        self._dispatcher_lock: asyncio.Lock | None = None
+        self._foreman_lock: asyncio.Lock | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.ui_event_queue = ui_event_queue
+
+        # Raiken text listeners — cross-surface subscribers that want a live
+        # feed of Raiken's streamed reply chunks. The Discord bridge uses this
+        # to build up a full reply and DM it back to the user.
+        self._raiken_text_listeners: set = set()
 
         self.recording = False
         self.audio_buffer: list[np.ndarray] = []
@@ -1398,6 +1618,24 @@ class Raiken:
     # --- UI emit helpers ------------------------------------------------------
     def _emit_chat(self, role: str, text: str, append: bool = False, done: bool = False):
         self.ui_event_queue.put(ChatEvent(role=role, text=text, append=append, done=done))
+        # Fan out "raiken" chunks to any registered text listeners (e.g. the
+        # Discord bridge collects them to stream back as a DM reply). Wrap in
+        # try so a misbehaving listener can't break the UI emit path.
+        if self._raiken_text_listeners and role == "raiken":
+            for listener in list(self._raiken_text_listeners):
+                try:
+                    listener(role, text, done)
+                except Exception as e:
+                    print(f"[raiken-listener] {listener}: {e}", flush=True)
+
+    def register_raiken_text_listener(self, fn):
+        """Subscribe to raiken text chunks (role + text + done). Used by
+        cross-surface bridges (Discord, future ntfy/web) that need to capture
+        a full reply and forward it somewhere other than the tkinter UI."""
+        self._raiken_text_listeners.add(fn)
+
+    def unregister_raiken_text_listener(self, fn):
+        self._raiken_text_listeners.discard(fn)
 
     def _emit_dispatch_badge(self, name: str, tier_label: str):
         """Surface a worker dispatch as an orange bordered badge in chat."""
@@ -1833,12 +2071,28 @@ class Raiken:
         # — Rook didn't say anything; Raiken should narrate briefly and stop.
         is_worker_return_wake = text.strip().startswith("[WORKER-RETURN]")
 
-        # Chain of command: Rook → Speaker → (authorize via request_dispatch
-        # tool) → Dispatcher. No auto-broadcast anymore. Speaker decides
-        # whether work is warranted and calls request_dispatch himself; the
-        # tool spawns a Dispatcher turn against the pre-authorized task. This
-        # eliminates the race where Speaker asked Rook "want me to check?"
-        # while Dispatcher had already fired.
+        # Option C parallel-listening: mirror Rook's raw message to the
+        # Foreman session concurrently with this Speaker turn. Foreman
+        # stays silent (no tool calls) — it just accumulates context. When
+        # Speaker later calls fire_foreman(), Foreman wakes and acts on
+        # the context it has been receiving. Skip for synthetic worker-return
+        # auto-wakes and [INTERRUPT] metadata turns — Foreman only needs
+        # Rook's actual words.
+        if (
+            not is_worker_return_wake
+            and self.foreman_client is not None
+            and text.strip()
+        ):
+            try:
+                asyncio.create_task(self._feed_foreman_silently(text))
+            except Exception as e:
+                print(f"[foreman silent feed schedule failed: {e}]", flush=True)
+
+        # Chain of command: Rook → Speaker + Foreman (parallel, silent
+        # feed above) → Speaker calls fire_foreman() → Foreman trigger
+        # turn runs against the context it has been accumulating. Speaker is
+        # the sole decision gate; Foreman never acts on raw user messages
+        # until Speaker fires the trigger.
 
         _display_text = text  # saved before preamble injection so the UI shows only Rook's words
         if _APP_REF is not None:
@@ -1995,6 +2249,30 @@ class Raiken:
                                     pending_short = ""
                                 self.sentence_q.put(sentence)
                                 flushes_done += 1
+                    elif isinstance(block, ToolUseBlock):
+                        # Model paused mid-turn to invoke a tool. Any text
+                        # accumulated in `buffer` / `pending_short` is a
+                        # COMPLETE spoken beat — the model chose to stop
+                        # talking before firing the tool. Common shape:
+                        # "one sec, checking memory files" -> read_memory_file.
+                        # Without this flush the text would sit in the buffer
+                        # (no terminal . or !) until the tool round-trips and
+                        # the turn ends, so Rook hears the "one sec" AFTER the
+                        # tool finished. Flush now regardless of threshold —
+                        # the ack may be short, but hearing it late is worse.
+                        tail = (
+                            (pending_short + " " + buffer).strip()
+                        )
+                        pending_short = ""
+                        buffer = ""
+                        if tail and not self._barge_flag:
+                            print(
+                                f"\n[tts] flush-on-tool-use "
+                                f"tool={block.name!r} chars={len(tail)}",
+                                flush=True,
+                            )
+                            self.sentence_q.put(tail)
+                            flushes_done += 1
             elif isinstance(msg, ResultMessage):
                 break
 
@@ -2055,36 +2333,105 @@ class Raiken:
         if text:
             await self.submit(text)
 
-    # --- Dispatcher (Raiken's silent half) ------------------------------------
-    async def _execute_dispatcher_turn(self, text: str):
-        """Broadcast the user's text to the Dispatcher SDK session in parallel
-        with the Speaker's conversational turn. The Dispatcher evaluates the
-        message and, if warranted, calls `dispatch_worker` — the SDK handles
-        that tool invocation internally via the MCP server, so by the time the
-        stream ends the work is already scheduled. The Dispatcher's text
-        output is drained but never emitted to chat — this half is silent by
-        design (though text blocks ARE captured in the dispatcher log so the
-        Speaker can surface them when Rook asks).
+    # --- Foreman (Raiken's silent half) ------------------------------------
+    # Option C parallel-listening: every user message is mirrored to the
+    # Foreman session as it arrives. Foreman's system prompt instructs
+    # it to stay silent (no tool calls) on raw user messages — it's a hot
+    # standby accumulating conversational context. Only when Speaker calls
+    # the fire_foreman tool does the trigger-turn run, at which point
+    # Foreman picks the agent and dispatches with the raw context it has
+    # already been receiving.
 
-        Not awaited from `_execute_turn`; runs as a background task. Failures
-        are logged and swallowed so they don't crash the Speaker's side.
+    async def _feed_foreman_silently(self, text: str):
+        """Mirror a raw user message to the Foreman SDK session. Foreman
+        is instructed by its system prompt to return without tool calls on
+        raw messages — this call just deposits the context into Foreman's
+        conversation. If Foreman DOES fire a tool here, we log a rule
+        violation but let it through (the dispatch proceeds without Speaker's
+        gate, which preserves behavior over losing the work).
 
-        UI feedback: emits DispatcherStatusEvent so Rook can see that the
-        Dispatcher half heard the message and what (if anything) it did.
-        """
-        if self.dispatcher_client is None or self._dispatcher_lock is None:
+        Not awaited from `_execute_turn` — runs as a background task. Uses
+        the shared _foreman_lock so silent-feed and trigger-turn never
+        race on the same SDK session."""
+        if self.foreman_client is None or self._foreman_lock is None:
             return
-        async with self._dispatcher_lock:
+        preview = (text or "").strip().replace("\n", " ")
+        if len(preview) > 300:
+            preview = preview[:300] + "\u2026"
+        async with self._foreman_lock:
+            FOREMAN_LOG.record("message_in_silent", text=preview)
+            try:
+                await self.foreman_client.query(text)
+                async for msg in self.foreman_client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, ToolUseBlock):
+                                # Rule violation — Foreman fired a tool
+                                # before the trigger arrived. Record it but
+                                # honor the dispatch so we don't lose work.
+                                tool_name = (block.name or "").split("__")[-1]
+                                inp = block.input or {}
+                                worker = str(inp.get("name") or "")
+                                FOREMAN_LOG.record(
+                                    "rule_violation_silent_tool",
+                                    tool=tool_name,
+                                    worker=worker,
+                                )
+                                if tool_name == "dispatch_worker":
+                                    self.ui_event_queue.put(
+                                        ForemanStatusEvent(
+                                            state="dispatched", detail=worker or "worker",
+                                        )
+                                    )
+                            elif isinstance(block, TextBlock):
+                                t = (block.text or "").strip().replace("\n", " ")
+                                if t:
+                                    if len(t) > 400:
+                                        t = t[:400] + "\u2026"
+                                    FOREMAN_LOG.record(
+                                        "foreman_text_silent", text=t,
+                                    )
+                    if isinstance(msg, ResultMessage):
+                        break
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                print(f"[foreman silent feed error] {err}", flush=True)
+                FOREMAN_LOG.record("error", error=err, phase="silent_feed")
+
+    async def _execute_foreman_trigger_turn(self, hint: str = ""):
+        """Fire Foreman on a [FIRE_FOREMAN] trigger. Foreman reviews the
+        context it has been accumulating via silent feeds, picks the right
+        named agent, and calls dispatch_worker. Runs exactly once per flushed
+        trigger (debounced upstream in _flush_fire_triggers).
+
+        Uses the same _foreman_lock as the silent feed so a trigger always
+        processes AFTER any in-flight silent feeds for prior user messages
+        have committed context."""
+        if self.foreman_client is None or self._foreman_lock is None:
+            return
+        trigger_lines = [
+            "[FIRE_FOREMAN] The Speaker has authorized a dispatch. Review "
+            "the conversation context you have been accumulating from Rook's "
+            "prior raw messages, pick the appropriate named agent, and call "
+            "dispatch_worker with a complete task text. Do not ask for "
+            "clarification — make your best-guess dispatch from the context "
+            "you have.",
+        ]
+        if hint:
+            h = hint.strip().replace("\n", " ")
+            if len(h) > 400:
+                h = h[:400] + "\u2026"
+            trigger_lines.append("")
+            trigger_lines.append(f"Speaker hint (optional slant): {h}")
+        trigger_body = "\n".join(trigger_lines)
+        async with self._foreman_lock:
             dispatched_any = False
             probed = False
-            preview = (text or "").strip().replace("\n", " ")
-            if len(preview) > 300:
-                preview = preview[:300] + "\u2026"
-            DISPATCHER_LOG.record("message_in", text=preview)
-            self.ui_event_queue.put(DispatcherStatusEvent(state="thinking"))
+            FOREMAN_LOG.record("fire_trigger_enter", hint=hint[:200] if hint else "")
+            self.ui_event_queue.put(ForemanStatusEvent(state="thinking"))
             try:
-                await self.dispatcher_client.query(text)
-                async for msg in self.dispatcher_client.receive_response():
+                await self.foreman_client.query(trigger_body)
+                async for msg in self.foreman_client.receive_response():
                     if isinstance(msg, AssistantMessage):
                         for block in msg.content:
                             if isinstance(block, ToolUseBlock):
@@ -2097,65 +2444,59 @@ class Raiken:
                                     if len(task_preview) > 300:
                                         task_preview = task_preview[:300] + "\u2026"
                                     dispatched_any = True
-                                    DISPATCHER_LOG.record(
+                                    FOREMAN_LOG.record(
                                         "tool_call",
                                         tool="dispatch_worker",
                                         worker=worker,
                                         task=task_preview,
                                     )
                                     self.ui_event_queue.put(
-                                        DispatcherStatusEvent(
+                                        ForemanStatusEvent(
                                             state="dispatched", detail=worker,
                                         )
                                     )
                                 elif tool_name == "list_workers":
                                     probed = True
-                                    DISPATCHER_LOG.record(
+                                    FOREMAN_LOG.record(
                                         "tool_call", tool="list_workers",
                                     )
-                                    # Dispatched overrides probing in the UI.
                                     if not dispatched_any:
                                         self.ui_event_queue.put(
-                                            DispatcherStatusEvent(state="probing")
+                                            ForemanStatusEvent(state="probing")
                                         )
                             elif isinstance(block, TextBlock):
-                                # Dispatcher text is not rendered to chat, but
-                                # we capture a preview so the Speaker can
-                                # narrate the Dispatcher's reasoning if Rook
-                                # asks. Kept short — the model shouldn't lean
-                                # on this as a real output channel.
                                 t = (block.text or "").strip().replace("\n", " ")
                                 if t:
                                     if len(t) > 400:
                                         t = t[:400] + "\u2026"
-                                    DISPATCHER_LOG.record(
-                                        "dispatcher_text", text=t,
+                                    FOREMAN_LOG.record(
+                                        "foreman_text", text=t,
                                     )
                     if isinstance(msg, ResultMessage):
                         break
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
-                print(f"[dispatcher turn error] {err}", flush=True)
-                DISPATCHER_LOG.record("error", error=err)
+                print(f"[foreman trigger turn error] {err}", flush=True)
+                FOREMAN_LOG.record("error", error=err, phase="trigger_turn")
                 self.ui_event_queue.put(
-                    DispatcherStatusEvent(state="failed", detail=type(e).__name__)
+                    ForemanStatusEvent(state="failed", detail=type(e).__name__)
                 )
                 return
-            # Normal end-of-stream.
             if dispatched_any:
-                DISPATCHER_LOG.record("done", dispatched=True)
+                FOREMAN_LOG.record("done", dispatched=True)
             else:
-                DISPATCHER_LOG.record(
+                FOREMAN_LOG.record(
                     "decision", dispatched=False, probed=probed,
+                    note="trigger produced no dispatch",
                 )
-                self.ui_event_queue.put(DispatcherStatusEvent(state="idle"))
+                self.ui_event_queue.put(ForemanStatusEvent(state="idle"))
 
     # --- Boot -----------------------------------------------------------------
     async def run(self):
         self.loop = asyncio.get_running_loop()
         # Lock lives on the loop; only create it inside run() so it binds to the
         # active asyncio loop rather than a stale one from a prior attempt.
-        self._dispatcher_lock = asyncio.Lock()
+        self._foreman_lock = asyncio.Lock()
         self._emit_status("orchestrator", "busy", "starting")
 
         tts_launched = self._launch_tts_if_needed()
@@ -2217,42 +2558,42 @@ class Raiken:
         keyboard.on_press_key(HOTKEY, self._on_press)
         keyboard.on_release_key(HOTKEY, self._on_release)
 
-        # --- Raiken Speaker / Dispatcher split ----------------------------------
+        # --- Raiken Speaker / Foreman split ----------------------------------
         # Raiken is one entity running two SDK sessions in parallel:
         #   * Speaker    (self.client)            — conversation, TTS, vault ops,
-        #                                          dispatcher-log introspection.
-        #   * Dispatcher (self.dispatcher_client) — silent worker dispatch.
+        #                                          foreman-log introspection.
+        #   * Foreman (self.foreman_client) — silent worker dispatch.
         # Every user submit broadcasts to BOTH. Speaker responds with speech;
-        # Dispatcher evaluates the same message and fires dispatch_worker in
+        # Foreman evaluates the same message and fires dispatch_worker in
         # parallel. Tool access is split at the SDK level so double-dispatch
         # is impossible by construction (Speaker doesn't even SEE the dispatch
-        # tool). Speaker has read_dispatcher_log so it can tell Rook what the
-        # Dispatcher half is doing when asked.
+        # tool). Speaker has read_foreman_log so it can tell Rook what the
+        # Foreman half is doing when asked.
         # Bootstrap context pulls MANIFEST.md at boot so both halves know RCC
         # exists, the repo URL, the canonical agent roster, and what memory
         # files are available. Without this each SDK starts cold every launch
         # and acts like it has no idea what project it's in.
         bootstrap = _build_bootstrap_context()
-        # Dispatcher gets a compact "recent activity" continuity block so he
+        # Foreman gets a compact "recent activity" continuity block so he
         # knows what he was doing before the last restart. Pulled from the
-        # on-disk dispatcher log (which replays its tail at DispatcherLog
+        # on-disk foreman log (which replays its tail at ForemanLog
         # init). Empty on fresh installs / cleared logs. RCC 2.0 Phase 2.
         try:
-            continuity = DISPATCHER_LOG.build_boot_continuity_block(limit=30, max_chars=2500)
+            continuity = FOREMAN_LOG.build_boot_continuity_block(limit=30, max_chars=2500)
         except Exception as e:
             print(f"[boot] continuity block failed: {e}", flush=True)
             continuity = ""
         continuity_block = ""
         if continuity:
             continuity_block = (
-                "\n\n--- DISPATCHER CONTINUITY (recent activity from prior session, "
+                "\n\n--- FOREMAN CONTINUITY (recent activity from prior session, "
                 "oldest-first; use this to pick up where you left off, but treat the "
                 "CURRENT user message as the live priority) ---\n"
                 + continuity
                 + "\n--- END CONTINUITY ---\n\n"
             )
         speaker_system = bootstrap + SYSTEM_PROMPT
-        dispatcher_system = bootstrap + continuity_block + DISPATCHER_SYSTEM_PROMPT
+        foreman_system = bootstrap + continuity_block + FOREMAN_SYSTEM_PROMPT
 
         speaker_options = ClaudeAgentOptions(
             system_prompt=speaker_system,
@@ -2261,7 +2602,7 @@ class Raiken:
                 "raiken-vault": VAULT_MCP_SERVER,
                 "raiken-introspection": INTROSPECTION_MCP_SERVER,
                 "raiken-memory": MEMORY_MCP_SERVER,
-                "raiken-dispatch-gate": DISPATCH_GATE_MCP_SERVER,
+                "raiken-foreman-gate": FOREMAN_GATE_MCP_SERVER,
             },
             allowed_tools=[
                 "mcp__raiken-vault__vault_status",
@@ -2271,14 +2612,14 @@ class Raiken:
                 "mcp__raiken-vault__vault_copy_username",
                 "mcp__raiken-vault__vault_copy_totp",
                 "mcp__raiken-vault__vault_lock",
-                "mcp__raiken-introspection__read_dispatcher_log",
+                "mcp__raiken-introspection__read_foreman_log",
                 "mcp__raiken-memory__read_memory_file",
                 "mcp__raiken-memory__log_memory_compaction",
-                "mcp__raiken-dispatch-gate__request_dispatch",
+                "mcp__raiken-foreman-gate__fire_foreman",
             ],
         )
-        dispatcher_options = ClaudeAgentOptions(
-            system_prompt=dispatcher_system,
+        foreman_options = ClaudeAgentOptions(
+            system_prompt=foreman_system,
             permission_mode="bypassPermissions",
             mcp_servers={
                 "raiken-workers": WORKER_MCP_SERVER,
@@ -2292,7 +2633,7 @@ class Raiken:
             ],
         )
         async with ClaudeSDKClient(options=speaker_options) as self.client, \
-                   ClaudeSDKClient(options=dispatcher_options) as self.dispatcher_client:
+                   ClaudeSDKClient(options=foreman_options) as self.foreman_client:
             self._emit_status("orchestrator", "up")
             self._emit_status("ptt", "up")
             self._emit_chat("system", f"Raiken ready. Hold {HOTKEY.upper()} to talk, or type below.")
@@ -2332,12 +2673,13 @@ class RaikenApp:
         # worker (two `claude --resume <id>` subprocesses would race the session).
         self._worker_locks: dict[str, asyncio.Lock] = {}
 
-        # Phase 4: dispatch-authorization debounce. request_dispatch calls pile
-        # up here instead of firing Dispatcher one-per-call; a 2-sec timer
-        # flushes the whole batch so rapid follow-up asks bundle coherently.
-        self._pending_authorizations: list[dict] = []
-        self._authorization_lock = threading.Lock()
-        self._authorization_timer_handle = None  # asyncio.TimerHandle | None
+        # Option C: fire_foreman trigger debounce. Multiple fire_foreman
+        # calls pile up here instead of firing Foreman one-per-call; a
+        # 2-sec timer coalesces them into one trigger since Foreman
+        # already has full conversational context and one run covers all.
+        self._pending_fire_triggers: list[dict] = []
+        self._fire_trigger_lock = threading.Lock()
+        self._fire_trigger_timer_handle = None  # asyncio.TimerHandle | None
 
         # Phase 4: worker-return aggregation window. Every worker completion
         # resets a 3-sec timer (capped at 12s absolute); when it fires the
@@ -2420,7 +2762,7 @@ class RaikenApp:
         #
         # `parent` identifies a sub-agent's owning named agent (e.g. an
         # Oracle-spawned Iris). UI nests these rows beneath their parent row.
-        # None = top-level (dispatched directly by Raiken's Dispatcher).
+        # None = top-level (dispatched directly by Raiken's Foreman).
         origin = self._current_origin
         with self._active_workers_lock:
             entry = self._active_workers.get(name)
@@ -2636,80 +2978,66 @@ class RaikenApp:
                 "completed_at": time.time(),
             })
 
-    # --- Phase 4: dispatch-authorization debounce ---------------------------
-    # request_dispatch accumulates tasks for 2 seconds before firing one
-    # Dispatcher turn with all of them. If Rook rambles through multiple
-    # related asks ("fix the UI lag, also the tab sizing is bad, also the
-    # vault button is laggy"), Speaker fires request_dispatch multiple times
-    # in quick succession. Without this, we'd dispatch three workers who
-    # might step on each other. With this, the Dispatcher sees all three at
-    # once and can bundle them into one well-scoped task.
-    AUTHORIZATION_DEBOUNCE_SEC = 2.0
+    # --- Option C: fire_foreman trigger debounce ---------------------------
+    # Multiple fire_foreman calls inside a 2-sec window coalesce into one
+    # Foreman trigger. Foreman already holds Rook's full conversational
+    # context from the parallel-feed pipeline, so one run covers everything
+    # Rook asked for — Speaker doesn't need to bundle task strings the way
+    # the old request_dispatch debounce did.
+    FIRE_TRIGGER_DEBOUNCE_SEC = 2.0
 
-    def enqueue_authorization(self, task: str, reason: str):
-        """Queue a task authorization and reset the flush timer. Idempotent;
+    def enqueue_fire_trigger(self, hint: str):
+        """Queue a fire_foreman trigger and reset the flush timer. Idempotent;
         safe to call from any asyncio context."""
         loop = self.raiken.loop or self.asyncio_loop
-        with self._authorization_lock:
-            self._pending_authorizations.append({
-                "task": task, "reason": reason, "ts": time.time(),
+        with self._fire_trigger_lock:
+            self._pending_fire_triggers.append({
+                "hint": hint or "", "ts": time.time(),
             })
-            # Cancel any existing timer and reset.
-            if self._authorization_timer_handle is not None:
+            if self._fire_trigger_timer_handle is not None:
                 try:
-                    self._authorization_timer_handle.cancel()
+                    self._fire_trigger_timer_handle.cancel()
                 except Exception:
                     pass
-                self._authorization_timer_handle = None
+                self._fire_trigger_timer_handle = None
             if loop is not None:
                 try:
-                    self._authorization_timer_handle = loop.call_later(
-                        self.AUTHORIZATION_DEBOUNCE_SEC,
-                        self._flush_authorizations,
+                    self._fire_trigger_timer_handle = loop.call_later(
+                        self.FIRE_TRIGGER_DEBOUNCE_SEC,
+                        self._flush_fire_triggers,
                     )
                 except Exception:
                     # Fallback: fire immediately if we can't schedule.
-                    self._flush_authorizations()
+                    self._flush_fire_triggers()
 
-    def _flush_authorizations(self):
-        """Drain buffered authorizations and fire one Dispatcher turn with
-        the bundled task. Runs on the asyncio loop (scheduled via call_later)."""
-        with self._authorization_lock:
-            batch = list(self._pending_authorizations)
-            self._pending_authorizations.clear()
-            self._authorization_timer_handle = None
+    def _flush_fire_triggers(self):
+        """Drain buffered fire_foreman triggers and fire one Foreman run.
+        Runs on the asyncio loop (scheduled via call_later)."""
+        with self._fire_trigger_lock:
+            batch = list(self._pending_fire_triggers)
+            self._pending_fire_triggers.clear()
+            self._fire_trigger_timer_handle = None
         if not batch:
             return
-        if len(batch) == 1:
-            bundled = batch[0]["task"]
-        else:
-            # Bundle multiple tasks into one coherent Dispatcher prompt.
-            lines = [
-                f"Rook authorized {len(batch)} related tasks in quick succession. "
-                f"Evaluate together; bundle into one dispatch if they cohere "
-                f"(e.g. all UI work -> one Shadowling task with all fixes), "
-                f"or separate if they're genuinely unrelated. Do not dispatch "
-                f"two named agents to overlapping work.",
-                "",
-            ]
-            for i, b in enumerate(batch, 1):
-                rs = f" (reason: {b['reason']})" if b.get("reason") else ""
-                lines.append(f"{i}. {b['task']}{rs}")
-            bundled = "\n".join(lines)
+        # Coalesce hints — multiple triggers in the window usually share
+        # intent. Non-empty hints join with " | "; if none were given, the
+        # trigger fires with no hint and Foreman works from context alone.
+        hints = [b["hint"].strip() for b in batch if b.get("hint", "").strip()]
+        coalesced_hint = " | ".join(hints) if hints else ""
         try:
-            DISPATCHER_LOG.record(
-                "authorize_flush",
+            FOREMAN_LOG.record(
+                "fire_flush",
                 count=len(batch),
-                preview=(bundled[:300] + ("…" if len(bundled) > 300 else "")),
+                hint_preview=(coalesced_hint[:300] + ("…" if len(coalesced_hint) > 300 else "")),
             )
         except Exception:
             pass
-        if self.raiken is None or self.raiken.dispatcher_client is None:
+        if self.raiken is None or self.raiken.foreman_client is None:
             return
         try:
-            asyncio.create_task(self.raiken._execute_dispatcher_turn(bundled))
+            asyncio.create_task(self.raiken._execute_foreman_trigger_turn(coalesced_hint))
         except Exception as e:
-            print(f"[authorizations] flush failed: {e}", flush=True)
+            print(f"[fire-trigger] flush failed: {e}", flush=True)
 
     # --- Phase 4: worker-return aggregation window --------------------------
     # When workers finish close together, aggregating their narrations into
@@ -2858,7 +3186,7 @@ class RaikenApp:
             return {"ok": False, "error": "missing parent/task/tier"}
 
         cfg = load_config()
-        # Depth cap: Raiken Dispatcher is depth 0, a named agent's sub is depth
+        # Depth cap: Raiken Foreman is depth 0, a named agent's sub is depth
         # 1. By default sub-sub-agents are denied.
         max_depth = int(cfg.get("max_depth", 1))
         with self._active_workers_lock:
@@ -3381,6 +3709,13 @@ class RaikenApp:
         self.start_asyncio()
         self.start_presence_monitor()
         self.start_vault_status_monitor()
+        # Discord bridge — opt-in via RAIKEN_DISCORD_BOT_TOKEN + RAIKEN_DISCORD_USER_IDS.
+        # Disabled by default so a fresh install doesn't do anything unexpected.
+        try:
+            self._discord_bridge = maybe_start_discord_bridge(self)
+        except Exception as e:
+            print(f"[raiken] discord bridge failed to start: {e}", flush=True)
+            self._discord_bridge = None
         self.window = RaikenWindow(self)
         self.tray = RaikenTray(self, self.window)
         self.tray.run_detached()
