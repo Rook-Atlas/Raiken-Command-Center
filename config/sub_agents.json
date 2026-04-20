@@ -1,0 +1,6 @@
+{
+  "escalation_threshold_tier": "opus",
+  "escalation_policy": "auto_deny",
+  "max_sub_agents_per_parent": 5,
+  "max_depth": 1
+}

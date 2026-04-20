@@ -153,6 +153,25 @@ class WorkerStatusEvent:
     summary: str  # text of the currently in_progress todo item
 
 
+@dataclass
+class DispatcherStatusEvent:
+    """Emitted by Raiken's Dispatcher half (the silent SDK) so the UI can
+    confirm that the Dispatcher heard the user's message and show what it's
+    doing. Raiken is one entity running in two modes: the Speaker (converses
+    with Rook) and the Dispatcher (silently fires worker dispatches). Both
+    receive every user message.
+
+    state values:
+      'thinking'    — stream opened, no tool call yet
+      'dispatched'  — Dispatcher called dispatch_worker (detail = worker name)
+      'idle'        — stream ended with no dispatch (heard, chose not to act)
+      'failed'      — stream errored out
+      'probing'     — Dispatcher called list_workers (informational)
+    """
+    state: str
+    detail: str = ""
+
+
 # -----------------------------------------------------------------------------
 # Task-summary heuristic (no LLM call — just first meaningful line of prompt)
 # -----------------------------------------------------------------------------
@@ -273,8 +292,21 @@ class RaikenWindow:
             pass
 
         self._streaming_tag = None
-        # Structured message log for copy/debug-dump.
+        # Structured message log for copy/debug-dump. Capped — see _trim_retention.
         self._messages: list[dict] = []   # [{role, text, ts}]
+        # Retention caps. Long sessions otherwise grow chat/log Text widgets
+        # without bound; tk.Text layout and .see() cost scale with content,
+        # and each embedded badge (dispatch/worker_done) is a live Tk widget
+        # tree that costs layout work on every window resize. Trimming keeps
+        # memory flat and resize smooth over multi-hour sessions.
+        self._chat_max_lines: int = 4000
+        self._log_max_lines: int = 12000
+        self._messages_max: int = 800
+        # Ticks between trim passes. Trim is cheap when the widget is under
+        # the cap (just a line-count probe), so 1 Hz is fine; don't run it on
+        # every event batch because a streaming turn doesn't change line
+        # totals fast enough to matter.
+        self._trim_interval_ms: int = 2000
         # Dynamically-registered chat tags for worker roles (e.g. "shadowling commander").
         self._dynamic_role_tags: set[str] = set()
         # Streaming state tracked separately for the Chat tab and the Log tab,
@@ -307,6 +339,7 @@ class RaikenWindow:
         self.root.after(2000, self._poll_usage)
         self.root.after(100, self._animate_spinner)
         self.root.after(1500, self._poll_vault)
+        self.root.after(self._trim_interval_ms, self._trim_retention)
 
     # --- ttk theming for dark scrollbars --------------------------------------
     def _setup_styles(self):
@@ -352,6 +385,31 @@ class RaikenWindow:
         self.spinner_label.pack(side=tk.LEFT)
         self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         self._spinner_idx = 0
+
+        # Dispatcher activity chip. Raiken has two SDK "halves": the Speaker
+        # (conversational, this spinner above) and the Dispatcher (silent,
+        # fires workers). Sits next to the Speaker spinner so Rook can see
+        # both halves at a glance. Distinctly purple palette so it can't be
+        # confused with the Speaker's orange spinner. States:
+        #   idle/—      gray      (dim — no turn in flight)
+        #   thinking    violet    (stream opened, no tool call yet)
+        #   probing     steel     (Dispatcher called list_workers)
+        #   dispatched  green     (Dispatcher dispatched a worker; detail=name)
+        #   failed      red       (Dispatcher stream errored)
+        self.dispatcher_label = tk.Label(
+            status, text="\u25C6 Dispatcher: —", fg="#666", bg=BG_PANEL,
+            font=("Segoe UI", 9, "bold"), padx=10, pady=8,
+        )
+        self.dispatcher_label.pack(side=tk.LEFT)
+        self._dispatcher_state: str = "idle"
+        self._dispatcher_detail: str = ""
+        # When a dispatched/idle/failed state arrives we show it for a few
+        # seconds then auto-fade back to the dim "—" idle look, so the chip
+        # doesn't get stuck stale between turns.
+        self._dispatcher_clear_after_id: str | None = None
+        # Remembered last dispatch target — surfaced as a tooltip on the chip
+        # so Rook can see what was last sent even after the chip fades.
+        self._dispatcher_last_target: str = ""
 
         # Presence indicator + manual override toggle. Three display states:
         # active (green), maybe (amber — recent but no very-recent input),
@@ -789,6 +847,8 @@ class RaikenWindow:
                     self._apply_worker_status(evt)
                 elif isinstance(evt, PresenceEvent):
                     self._apply_presence(evt)
+                elif isinstance(evt, DispatcherStatusEvent):
+                    self._apply_dispatcher_status(evt)
         except queue.Empty:
             pass
         finally:
@@ -833,29 +893,11 @@ class RaikenWindow:
             return "ROOK"
         return role.upper()
 
-    def _append_to_log(self, evt: ChatEvent):
-        """Log tab is the verbatim mirror — always receives every chat event."""
-        if not self._batch_updating:
-            self.log_text.configure(state="normal")
-        new_bubble = self._log_streaming_tag != evt.role
-        if new_bubble:
-            ts_str = time.strftime("%H:%M:%S")
-            self.log_text.insert(tk.END, f"\n{self._display_role(evt.role)}   {ts_str}\n", "label")
-        if evt.text:
-            self.log_text.insert(tk.END, evt.text, evt.role)
-        if evt.done:
-            self._log_streaming_tag = None
-            self.log_text.insert(tk.END, "\n")
-        else:
-            self._log_streaming_tag = evt.role
-        if not self._batch_updating:
-            self.log_text.see(tk.END)
-            self.log_text.configure(state="disabled")
-
     def _apply_chat(self, evt: ChatEvent):
-        # Always mirror to the log tab (verbose surface).
+        # Log tab no longer mirrors chat — it's reserved for worker reports
+        # (see _apply_worker_done's collapsible cards). Rook didn't want to
+        # see his own messages and Raiken's spoken replies cluttering the log.
         self._ensure_role_tag(evt.role)
-        self._append_to_log(evt)
 
         # log_only events skip the main chat (used for full worker outputs —
         # those surface in chat as a clickable badge instead via WorkerDoneEvent).
@@ -945,13 +987,149 @@ class RaikenWindow:
         # Register for in-place completion flip.
         self._active_dispatch_badges[evt.name] = badge
 
-    def _apply_worker_done(self, evt: WorkerDoneEvent):
-        """Insert a compact clickable badge in chat for a completed worker.
-        Click → switch to Log tab + scroll to that worker's transcript."""
-        self._ensure_role_tag(evt.name)
-        # Record a log mark at the current log position so we can scroll to it
-        # later. Put it slightly before the log's current tail so the worker's
-        # section is visible after scroll.
+    # --- Worker status classification (heuristic from output text) ----------
+    _WORKER_STATUS_NEEDS_INPUT_MARKERS = (
+        "need your input", "need input from", "please grant", "please allow",
+        "please approve", "please confirm", "please verify", "needs approval",
+        "permission required", "needs your okay", "waiting for you to",
+        "could you confirm", "let me know if", "please add", "please provide",
+        "i need you to", "requires your", "awaiting your",
+    )
+    _WORKER_STATUS_NOOP_MARKERS = (
+        "no changes needed", "no-op", "already done", "nothing to do",
+    )
+    _WORKER_STATUS_NEEDS_INFO_MARKERS = (
+        "need more info", "need more context", "need clarification",
+        "ambiguous", "unclear which", "could you clarify",
+    )
+
+    def _classify_worker_status(self, success: bool, output: str, error: str) -> tuple[str, str]:
+        """Derive a short status label + color from the worker's outcome.
+        Used as the headline on the log card so Rook can scan results at a
+        glance without expanding each one."""
+        if not success:
+            return ("failed", "#d9534f")
+        out_lower = (output or "").lower()
+        for m in self._WORKER_STATUS_NEEDS_INPUT_MARKERS:
+            if m in out_lower:
+                return ("needs input from Rook", "#f0ad4e")
+        for m in self._WORKER_STATUS_NEEDS_INFO_MARKERS:
+            if m in out_lower:
+                return ("needs more info", "#f0ad4e")
+        for m in self._WORKER_STATUS_NOOP_MARKERS:
+            if m in out_lower:
+                return ("no-op", "#888")
+        return ("succeeded", "#5cb85c")
+
+    def _insert_worker_card_in_log(self, evt: "WorkerDoneEvent", result: dict | None):
+        """Append a collapsible worker-result card to the Log tab. Header shows
+        agent name + status; body (hidden by default) holds task + output."""
+        task = (result.get("task") or "").strip() if result else ""
+        output = (result.get("output") or "").strip() if result else ""
+        error = (result.get("error") or "").strip() if result else ""
+        status_label, status_color = self._classify_worker_status(
+            evt.success, output, error
+        )
+
+        card_bg = "#1f1f1f"
+        body_bg = "#141414"
+        border_default = "#2d2d2d"
+        border_hover = "#555"
+
+        card = tk.Frame(
+            self.log_text, bg=card_bg, padx=0, pady=0,
+            relief=tk.FLAT, highlightthickness=1, highlightbackground=border_default,
+        )
+
+        header = tk.Frame(card, bg=card_bg, cursor="hand2")
+        header.pack(fill=tk.X)
+        glyph = tk.Label(
+            header, text="\u25B8", fg="#888", bg=card_bg,
+            font=("Segoe UI", 10, "bold"), padx=8, pady=4,
+        )
+        glyph.pack(side=tk.LEFT)
+        tk.Label(
+            header, text=evt.name, fg="#ddd", bg=card_bg,
+            font=("Segoe UI", 10, "bold"), pady=4,
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            header, text="  -  Task Reported", fg="#888", bg=card_bg,
+            font=("Segoe UI", 9), pady=4,
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            header, text=f"  [{status_label}]", fg=status_color, bg=card_bg,
+            font=("Segoe UI", 9, "bold"), pady=4,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Label(
+            header, text=f"{evt.elapsed:.1f}s", fg="#666", bg=card_bg,
+            font=("Segoe UI", 8), padx=10, pady=4,
+        ).pack(side=tk.RIGHT)
+
+        body = tk.Frame(card, bg=body_bg, padx=10, pady=8)
+        # Body sections — built once; visibility toggled on click.
+        if task:
+            tk.Label(
+                body, text="TASK", fg="#666", bg=body_bg,
+                font=("Segoe UI", 8, "bold"), anchor="w",
+            ).pack(fill=tk.X)
+            task_w = tk.Text(
+                body, wrap=tk.WORD, bg=body_bg, fg="#9ad",
+                font=("Consolas", 9), borderwidth=0, highlightthickness=0,
+                width=80, height=min(12, max(2, task.count("\n") + 2)),
+                padx=0, pady=0,
+            )
+            task_w.insert("1.0", task)
+            task_w.configure(state="disabled")
+            task_w.pack(fill=tk.X, pady=(2, 8))
+
+        section_label = "OUTPUT" if evt.success else "ERROR"
+        body_text = output if evt.success else (error or "(no details)")
+        tk.Label(
+            body, text=section_label, fg="#666", bg=body_bg,
+            font=("Segoe UI", 8, "bold"), anchor="w",
+        ).pack(fill=tk.X)
+        body_w = tk.Text(
+            body, wrap=tk.WORD, bg=body_bg,
+            fg=("#ddd" if evt.success else "#e77"),
+            font=("Consolas", 9), borderwidth=0, highlightthickness=0,
+            width=80, height=min(30, max(3, body_text.count("\n") + 2)),
+            padx=0, pady=0,
+        )
+        body_w.insert("1.0", body_text)
+        body_w.configure(state="disabled")
+        body_w.pack(fill=tk.X, pady=(2, 0))
+
+        expanded = [False]
+
+        def _toggle(_e=None):
+            if expanded[0]:
+                body.pack_forget()
+                glyph.configure(text="\u25B8")
+            else:
+                body.pack(fill=tk.X)
+                glyph.configure(text="\u25BE")
+            expanded[0] = not expanded[0]
+
+        def _hi(_e=None):
+            card.configure(highlightbackground=border_hover)
+
+        def _lo(_e=None):
+            card.configure(highlightbackground=border_default)
+
+        # Bind on header + every label inside it so any click on the row toggles.
+        header.bind("<Button-1>", _toggle)
+        header.bind("<Enter>", _hi)
+        header.bind("<Leave>", _lo)
+        for child in header.winfo_children():
+            child.bind("<Button-1>", _toggle)
+            child.bind("<Enter>", _hi)
+            child.bind("<Leave>", _lo)
+
+        # Embed the card in the log Text widget.
+        if not self._batch_updating:
+            self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, "\n")
+        # Mark for badge-jump scrollto.
         mark_name = f"worker_{evt.run_id}"
         try:
             self.log_text.mark_set(mark_name, "end-1c")
@@ -959,37 +1137,23 @@ class RaikenWindow:
             self._log_marks[evt.run_id] = mark_name
         except Exception:
             pass
-
-        # Also dump the full worker transcript into the log tab, clearly
-        # sectioned, so the Log tab is a complete record without extra polling.
-        result = self.app.get_worker_result(evt.run_id) if hasattr(self.app, "get_worker_result") else None
-        if not self._batch_updating:
-            self.log_text.configure(state="normal")
-        status_glyph = "OK" if evt.success else "FAIL"
-        self.log_text.insert(
-            tk.END,
-            f"\n\u2501\u2501 worker: {evt.name}  [{status_glyph}  {evt.elapsed:.1f}s]  "
-            f"run_id={evt.run_id} \u2501\u2501\n",
-            "worker_section",
-        )
-        if result:
-            task = (result.get("task") or "").strip()
-            if task:
-                self.log_text.insert(tk.END, "TASK:\n", "label")
-                self.log_text.insert(tk.END, task + "\n", evt.name)
-            if evt.success:
-                out = (result.get("output") or "").strip()
-                if out:
-                    self.log_text.insert(tk.END, "\nOUTPUT:\n", "label")
-                    self.log_text.insert(tk.END, out + "\n", evt.name)
-            else:
-                err = (result.get("error") or "").strip()
-                self.log_text.insert(tk.END, "\nERROR:\n", "label")
-                self.log_text.insert(tk.END, (err or "(no details)") + "\n", "error")
+        self.log_text.window_create(tk.END, window=card)
         self.log_text.insert(tk.END, "\n")
         if not self._batch_updating:
             self.log_text.see(tk.END)
             self.log_text.configure(state="disabled")
+
+        # Failures auto-expand so Rook sees the error without clicking.
+        if not evt.success:
+            _toggle()
+
+    def _apply_worker_done(self, evt: WorkerDoneEvent):
+        """Insert a compact clickable badge in chat AND a collapsible card in
+        the Log tab. Click the chat badge → switch to Log tab + scroll to the
+        card. Click the card header → expand/collapse the body."""
+        self._ensure_role_tag(evt.name)
+        result = self.app.get_worker_result(evt.run_id) if hasattr(self.app, "get_worker_result") else None
+        self._insert_worker_card_in_log(evt, result)
 
         # Clear live status so the panel shows "done" state on next refresh.
         self._worker_live_status.pop(evt.name, None)
@@ -1151,6 +1315,76 @@ class RaikenWindow:
         self.presence_label.configure(
             fg=colors.get(evt.state, FG_MUTED), text=txt
         )
+
+    def _apply_dispatcher_status(self, evt: "DispatcherStatusEvent"):
+        """Update the Dispatcher activity chip. Confirms to Rook that
+        Raiken's Dispatcher half heard the message (it runs silently, so
+        without this the Dispatcher side gives no visible feedback).
+        Purple-family palette so it's distinct from the Speaker's orange
+        spinner."""
+        if not hasattr(self, "dispatcher_label") or self.dispatcher_label is None:
+            return
+        self._dispatcher_state = evt.state
+        self._dispatcher_detail = evt.detail or ""
+
+        if evt.state == "thinking":
+            txt = "\u25C6 Dispatcher: listening\u2026"
+            fg = "#a78bfa"   # violet
+            sticky = True
+        elif evt.state == "probing":
+            txt = "\u25C6 Dispatcher: checking roster\u2026"
+            fg = "#8aa7d8"   # steel blue
+            sticky = True
+        elif evt.state == "dispatched":
+            name = (evt.detail or "worker").strip()
+            self._dispatcher_last_target = name
+            txt = f"\u25C6 Dispatcher \u2192 {name}"
+            fg = "#5cb85c"   # green
+            sticky = False
+        elif evt.state == "failed":
+            extra = f" ({evt.detail})" if evt.detail else ""
+            txt = f"\u25C6 Dispatcher: failed{extra}"
+            fg = "#d9534f"   # red
+            sticky = False
+        else:  # idle / fallback
+            txt = "\u25C6 Dispatcher: heard, no-op"
+            fg = "#888"
+            sticky = False
+
+        self.dispatcher_label.configure(text=txt, fg=fg)
+        # Tooltip text: remembers the last dispatch target across fade-outs.
+        self.dispatcher_label._full_text = (
+            f"last dispatch: {self._dispatcher_last_target}"
+            if self._dispatcher_last_target
+            else "Raiken Dispatcher \u2014 silent worker dispatch half"
+        )
+
+        # Cancel any pending auto-clear from a previous turn.
+        if self._dispatcher_clear_after_id is not None:
+            try:
+                self.root.after_cancel(self._dispatcher_clear_after_id)
+            except Exception:
+                pass
+            self._dispatcher_clear_after_id = None
+
+        # Non-sticky terminal states fade back to dim after a few seconds
+        # so the chip isn't stuck showing stale info between turns.
+        if not sticky:
+            self._dispatcher_clear_after_id = self.root.after(
+                6000, self._clear_dispatcher_label
+            )
+
+    def _clear_dispatcher_label(self):
+        self._dispatcher_clear_after_id = None
+        if not hasattr(self, "dispatcher_label") or self.dispatcher_label is None:
+            return
+        self._dispatcher_state = "idle"
+        self._dispatcher_detail = ""
+        if self._dispatcher_last_target:
+            txt = f"\u25C6 Dispatcher: \u2014  (last: {self._dispatcher_last_target})"
+        else:
+            txt = "\u25C6 Dispatcher: \u2014"
+        self.dispatcher_label.configure(text=txt, fg="#666")
 
     def _cycle_presence_override(self):
         """Rotate the manual presence override: auto \u2192 active \u2192 away \u2192 auto.
@@ -1355,6 +1589,82 @@ class RaikenWindow:
         )
         return (active_key, named_key)
 
+    def _trim_text_widget(self, widget: tk.Text, max_lines: int) -> int:
+        # Trim oldest lines from a Text widget, destroying any embedded
+        # windows in the trimmed range first (tk.Text.window_create inserts
+        # live widget trees that leak unless explicitly destroy()'d before
+        # the text range is deleted).
+        try:
+            end_idx = widget.index("end-1c")
+            total = int(end_idx.split(".")[0])
+        except Exception:
+            return 0
+        if total <= max_lines:
+            return 0
+        cutoff = total - max_lines + 1
+        cutoff_idx = f"{cutoff}.0"
+        destroyed = 0
+        try:
+            for kind, value, _idx in widget.dump("1.0", cutoff_idx, window=True):
+                if kind != "window" or not value:
+                    continue
+                try:
+                    w = widget.nametowidget(value)
+                except Exception:
+                    continue
+                try:
+                    w.destroy()
+                    destroyed += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        was_disabled = str(widget.cget("state")) == "disabled"
+        if was_disabled:
+            widget.configure(state="normal")
+        try:
+            widget.delete("1.0", cutoff_idx)
+        except Exception:
+            pass
+        if was_disabled:
+            widget.configure(state="disabled")
+        return destroyed
+
+    def _trim_retention(self):
+        # Keep chat/log widgets and the structured message list bounded so
+        # memory stays flat and resize/layout work doesn't degrade over
+        # multi-hour sessions. Cheap when already under cap.
+        try:
+            chat_destroyed = self._trim_text_widget(self.chat, self._chat_max_lines)
+            self._trim_text_widget(self.log_text, self._log_max_lines)
+            # If we destroyed embedded dispatch badges, clear stale references
+            # so _apply_worker_done doesn't try to flip a destroyed widget.
+            if chat_destroyed and self._active_dispatch_badges:
+                dead = [
+                    name for name, w in self._active_dispatch_badges.items()
+                    if not bool(w.winfo_exists())
+                ]
+                for name in dead:
+                    self._active_dispatch_badges.pop(name, None)
+            if len(self._messages) > self._messages_max:
+                excess = len(self._messages) - self._messages_max
+                del self._messages[:excess]
+            # Prune log marks whose text line is gone (mark resolves to "1.0"
+            # when its anchor was deleted). Keeps _log_marks from growing
+            # forever as worker badges accumulate.
+            if self._log_marks:
+                stale: list[int] = []
+                for run_id, mark in self._log_marks.items():
+                    try:
+                        self.log_text.index(mark)
+                    except tk.TclError:
+                        stale.append(run_id)
+                for run_id in stale:
+                    self._log_marks.pop(run_id, None)
+        except Exception:
+            pass
+        self.root.after(self._trim_interval_ms, self._trim_retention)
+
     def _animate_spinner(self):
         # Show spinner while orchestrator is busy. _orchestrator_busy is kept
         # in sync by _apply_status so we avoid a cget() Tcl roundtrip per tick.
@@ -1440,13 +1750,43 @@ class RaikenWindow:
         #   1. Named agents from registry, sorted by tier (opus > sonnet > haiku > ollama)
         #      then alphabetical within tier.
         #   2. Any currently-active workers not already in the registry view.
+        # Sub-agents (active entries with parent=<named agent>) are inserted
+        # immediately after their parent and rendered with an indent so the
+        # tree is legible at a glance.
         named_by_name = {a.get("name", ""): a for a in named if a.get("name")}
-        ordered_names: list[str] = sorted(
+        top_level: list[str] = sorted(
             named_by_name.keys(),
             key=lambda n: (self._tier_sort_key(self._agent_tier(named_by_name[n])), n.lower()),
         )
+        # Ephemeral top-level actives (not in registry, no parent) after named.
         for n in active.keys():
-            if n not in named_by_name:
+            info = active.get(n, {}) or {}
+            if n in named_by_name:
+                continue
+            if info.get("parent"):
+                continue
+            top_level.append(n)
+
+        # Group sub-agents by parent (parent name -> list of sub names).
+        subs_by_parent: dict[str, list[str]] = {}
+        for n, info in active.items():
+            parent_n = (info or {}).get("parent")
+            if parent_n:
+                subs_by_parent.setdefault(parent_n, []).append(n)
+        for lst in subs_by_parent.values():
+            lst.sort(key=lambda s: (active.get(s, {}).get("started_at", 0), s.lower()))
+
+        # Flattened render order with sub-agents following their parent.
+        ordered_names: list[str] = []
+        for n in top_level:
+            ordered_names.append(n)
+            for sub in subs_by_parent.get(n, ()):
+                ordered_names.append(sub)
+        # Orphan sub-agents (parent no longer active) appear at the end so they
+        # don't disappear mid-dispatch.
+        seen = set(ordered_names)
+        for n in active.keys():
+            if n not in seen:
                 ordered_names.append(n)
 
         # Remove rows for agents that dropped out (shouldn't happen for named,
@@ -1460,15 +1800,26 @@ class RaikenWindow:
             entry = named_by_name.get(name, {})
             is_active = name in active
             act_info = active.get(name, {})
+            # Sub-agents carry a parent link set at register_active_worker time.
+            # We render them indented, in a darker band, with a small chevron
+            # prefix so the tree relationship is obvious at a glance.
+            sub_parent = (act_info or {}).get("parent") or ""
+            is_sub = bool(sub_parent)
             tier = self._agent_tier(entry) if entry else "sonnet"
             tier_pres = self.TIER_PRESENTATION.get(tier, self.TIER_PRESENTATION["sonnet"])
 
             # Active vs idle styling.
             row_bg = "#2d2d2d" if is_active else "#242424"
+            if is_sub:
+                # Slightly darker band + indent to signal nesting without adding
+                # a second tree widget. Active sub stays readable against parent.
+                row_bg = "#272727" if is_active else "#202020"
             name_fg = "#fff" if is_active else FG_MUTED
             tier_fg = tier_pres["color"] if is_active else "#555"
             status_txt = "active" if is_active else "idle"
             status_fg = "#f0ad4e" if is_active else "#555"
+            row_padx = 8 if not is_sub else 22          # indent sub-agents
+            name_prefix = "" if not is_sub else "\u2937 "  # down-right arrow
 
             task_preview = ""
             task_is_live = False    # True when preview comes from a TodoWrite stream
@@ -1487,7 +1838,7 @@ class RaikenWindow:
                 elapsed_txt = f"{int(now - act_info.get('started_at', now))}s"
 
             if name not in self._worker_rows:
-                row = tk.Frame(self.worker_list_container, bg=row_bg, pady=5, padx=8)
+                row = tk.Frame(self.worker_list_container, bg=row_bg, pady=5, padx=row_padx)
                 row.pack(fill=tk.X, pady=1)
 
                 top = tk.Frame(row, bg=row_bg)
@@ -1498,7 +1849,7 @@ class RaikenWindow:
                 )
                 tier_lbl.pack(side=tk.LEFT, padx=(0, 6))
                 name_lbl = tk.Label(
-                    top, text=name, fg=name_fg, bg=row_bg,
+                    top, text=f"{name_prefix}{name}", fg=name_fg, bg=row_bg,
                     font=("Segoe UI", 10, "bold"), anchor="w",
                 )
                 name_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -1573,16 +1924,18 @@ class RaikenWindow:
                 sig = (
                     row_bg, tier_fg, name_fg, status_fg, status_txt,
                     task_preview, task_lbl_fg, task_lbl_font,
-                    elapsed_txt, kill_bg, is_active,
+                    elapsed_txt, kill_bg, is_active, is_sub,
                 )
                 last_sig = getattr(row, "_last_sig", None)
                 row.task_lbl._full_text = task_full  # tooltip text is cheap — always refresh
                 if sig != last_sig:
-                    row.configure(bg=row_bg)
+                    row.configure(bg=row_bg, padx=row_padx)
                     row.top.configure(bg=row_bg)
                     row.bottom.configure(bg=row_bg)
                     row.tier_lbl.configure(fg=tier_fg, bg=row_bg)
-                    row.name_lbl.configure(fg=name_fg, bg=row_bg)
+                    row.name_lbl.configure(
+                        fg=name_fg, bg=row_bg, text=f"{name_prefix}{name}",
+                    )
                     row.status_lbl.configure(fg=status_fg, bg=row_bg, text=status_txt)
                     row.tier_label_lbl.configure(bg=row_bg)
                     row.task_lbl.configure(

@@ -55,6 +55,37 @@ WORKER_PERMISSION_PREAMBLE = (
     "permission-system block, report it precisely (tool name + path + error) — "
     "but do not pre-refuse based on your own assumptions about scope.\n"
     "\n"
+    "--- Orchestrator tools (RCC callback CLI) ---\n"
+    "You can talk back to the RCC orchestrator by invoking the following "
+    "shell command (Python helper bundled at C:\\Users\\Rook\\AI\\raiken\\worker_tools.py — "
+    "invoke via `python C:\\Users\\Rook\\AI\\raiken\\worker_tools.py <subcommand>`). "
+    "Env vars RAIKEN_CALLBACK_URL / RAIKEN_CALLBACK_TOKEN / RAIKEN_WORKER_NAME are "
+    "already set in your environment; you don't need to pass them.\n"
+    "\n"
+    "  status \"<short phase label>\"\n"
+    "     Push a 3-6 word verb-led present-progressive label to the RCC UI "
+    "(examples: \"researching web UI\", \"writing up findings\", \"running tests\"). "
+    "Call this on significant phase transitions so Rook can see what you're doing. "
+    "Overrides whatever the initial dispatch heuristic set.\n"
+    "\n"
+    "  dispatch-sub --tier <haiku|sonnet|opus> \"<task>\"\n"
+    "     Spawn a sub-agent under YOUR name. RCC picks a random thematic name "
+    "from the requested tier's pool and prints it on stdout. This call BLOCKS "
+    "until the sub-agent completes, then prints its final text output — treat "
+    "it like a Task tool: fire-and-read. Use for parallelizable subtasks (one "
+    "sub researches docs while you keep writing code). Haiku = fast/simple "
+    "scouts, Sonnet = specialists (default), Opus = heavy hitters (require "
+    "escalation approval; use sparingly).\n"
+    "\n"
+    "  escalate --tier <haiku|sonnet|opus> \"<task>\"\n"
+    "     Request approval BEFORE dispatching at a tier that requires "
+    "escalation (currently opus). Returns JSON {\"approved\": bool, \"reason\": str}. "
+    "If approved, follow up with dispatch-sub.\n"
+    "\n"
+    "These are ordinary Bash-tool shell invocations. If the commands exit with "
+    "a non-zero code, the error is printed to stderr — do not retry blindly, "
+    "read the message and adjust.\n"
+    "\n"
     "--- Task ---\n"
 )
 
@@ -327,6 +358,7 @@ async def run_worker(
     model: str | None = None,
     _is_retry: bool = False,
     on_event: "callable | None" = None,
+    callback_env: "dict | None" = None,
 ) -> dict:
     """Dispatch a task to the named worker. Blocks until it completes.
 
@@ -427,12 +459,21 @@ async def run_worker(
         # which crashed dispatch with "separator is found, but chunk is longer
         # than limit". 16 MB is well past anything a realistic worker turn will
         # emit on one line.
+        # Inject the orchestrator callback URL + token so the worker's
+        # worker_tools.py helper can reach us. Missing env means worker_tools
+        # bails out with a clear message rather than posting into the void.
+        env = None
+        if callback_env:
+            import os as _os
+            env = _os.environ.copy()
+            env.update({k: v for k, v in callback_env.items() if v is not None})
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=worker_cwd,
             limit=16 * 1024 * 1024,
+            env=env,
         )
 
         async def _drain_stdout():
@@ -498,7 +539,10 @@ async def run_worker(
             and "No conversation found" in err_text
         ):
             _reset_worker_session(name)
-            return await run_worker(name, task, timeout=timeout, model=model, _is_retry=True, on_event=on_event)
+            return await run_worker(
+                name, task, timeout=timeout, model=model,
+                _is_retry=True, on_event=on_event, callback_env=callback_env,
+            )
         return {
             "success": False,
             "error": f"worker '{name}' exited with code {proc.returncode}: "

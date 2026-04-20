@@ -12,6 +12,8 @@ Run:  .venv\\Scripts\\python.exe main.py
 Stop: tray icon -> Quit, or Ctrl+C
 """
 import asyncio
+import collections
+import json
 import os
 import queue
 import re
@@ -74,6 +76,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     AssistantMessage,
     TextBlock,
+    ToolUseBlock,
     ResultMessage,
     RateLimitEvent,
     tool,
@@ -81,8 +84,17 @@ from claude_agent_sdk import (
 )
 
 from workers import run_worker, list_workers, seed_named_workers, get_or_create_worker
-from ui import RaikenWindow, RaikenTray, ChatEvent, StatusEvent, WorkerDoneEvent, DispatchBadgeEvent, PresenceEvent, WorkerStatusEvent
+from ui import RaikenWindow, RaikenTray, ChatEvent, StatusEvent, WorkerDoneEvent, DispatchBadgeEvent, PresenceEvent, WorkerStatusEvent, DispatcherStatusEvent
 from bitwarden import BitwardenSession
+from sub_agents import (
+    ensure_config_file_exists,
+    load_config,
+    sample_sub_agent_name,
+    all_sub_agent_names,
+    tier_requires_escalation,
+    decide_escalation,
+)
+from worker_callback import WorkerCallbackServer
 
 import pyperclip
 
@@ -97,6 +109,25 @@ TTS_HEALTH_URL = "http://127.0.0.1:7851/health"
 TTS_LAUNCHER_BAT = r"C:\Users\Rook\AI\xtts\start_tts_server.bat"
 TTS_STARTUP_TIMEOUT_SEC = 90
 MIN_AUDIO_SEC = 0.3
+
+# --- TTS cadence knobs ------------------------------------------------------
+# First-flush threshold is aggressive so the first syllables of a reply reach
+# the speakers fast (low perceived latency). Subsequent flushes are longer so
+# XTTS has enough prosodic context to render natural cadence — a sequence of
+# tiny chunks causes duration-predictor artifacts and sounds sluggish /
+# "period period period" even though no silence is inserted between chunks.
+# Raise FIRST to 60-80 if first-word latency is fine and cadence needs more
+# smoothing; lower LATER to 80 if chunks feel too long.
+MIN_TTS_CHARS_FIRST = 40
+MIN_TTS_CHARS_LATER = 140
+
+# --- Worker-update hand-off knobs ------------------------------------------
+# When a worker completes while Raiken is still speaking, the auto-wake defers
+# until the current TTS fully drains, then plays a brief silence + prefix so
+# the hand-off is audibly distinct from ongoing speech. The prefix itself is
+# also taught in SYSTEM_PROMPT so the model opens its narration with it.
+WORKER_UPDATE_GAP_MS = 650           # silence inserted between prior speech and narration
+WORKER_UPDATE_PREFIX = "Agent update"   # leader phrase — keep in sync with SYSTEM_PROMPT
 
 SYSTEM_PROMPT = """You are Raiken, Rook's AI right-hand man. Your responses are read aloud
 via text-to-speech AND shown in a chat window, so:
@@ -150,41 +181,86 @@ Barge-in handling:
 - Don't apologize for being cut off or explain the barge-in. Just answer what
   Rook needs NOW.
 
-Worker dispatch — YOU DO NOT HAVE DISPATCH TOOLS.
+Your identity — one Raiken, three roles.
 
-A parallel SDK session called the Foreman handles ALL worker dispatch silently.
-Every message Rook sends goes to both of you at the same time. You respond
-conversationally; she evaluates the same message and dispatches the appropriate
-worker in parallel. You will never see her, she never speaks to Rook. You only
-see the RESULTS of her dispatches via [worker-updates] preambles on later turns.
+You are Raiken, but you run in three functional halves. THIS session is the
+Speaker — the conversational half Rook talks to. The other halves are:
+
+- Raiken Dispatcher — a second Claude Agent SDK session that ALSO receives
+  every message Rook sends. The Dispatcher is YOU, not a separate entity.
+  Its only job is to silently call dispatch_worker / list_workers in parallel
+  with your conversational reply. When Rook asks what you're doing in the
+  background, you are asking about yourself.
+- Raiken Agent — any dispatched worker (Marl, Oracle, Shadowling Commander,
+  etc.) acting through a worker body. Still Raiken, just a specialized role.
+
+ALWAYS speak in first person about all three halves. Never say "Foreman" —
+that name is retired. Never say "the dispatcher did X" as if referring to a
+different agent. Say "I dispatched X to myself", "I've got an agent working
+on it", "let me check what I'm doing over there". The split is internal
+plumbing; to Rook it's one Raiken.
+
+Worker dispatch — YOU (the Speaker) DO NOT HAVE DISPATCH TOOLS.
+
+Your Dispatcher half does. Every message Rook sends reaches both halves at
+once. You respond conversationally; your Dispatcher half evaluates the same
+message and fires the worker in parallel. The Speaker stream and the
+Dispatcher stream don't share state — you coordinate through the dispatcher
+log (see below) and through [worker-updates] preambles on later turns.
 
 How this changes your behavior:
-- When Rook asks for work, acknowledge briefly ("on it", "looking now", "sending
-  someone on it") — Foreman will have already started dispatching by the time
-  you finish that sentence. Your acknowledgment is courtesy, not a trigger.
-- Do NOT try to dispatch yourself. You have no dispatch tool. Attempting it
-  does nothing.
-- Do NOT say "dispatching Oracle" as if YOU are deciding the agent — you don't
-  know which agent Foreman picked. Say generic acknowledgments ("sending
-  someone", "on it", "worker's heading out"). If Rook asks which agent,
-  truthfully say you'll know when the return shows up.
+- When Rook asks for work, acknowledge briefly in first person ("on it",
+  "sending someone out", "I'm on it") — your Dispatcher half will already
+  be firing by the time you finish the sentence.
+- Do NOT try to dispatch yourself from THIS session. You have no dispatch
+  tool here. Attempting it does nothing.
+- Do NOT pre-name a specific agent ("dispatching Oracle") — you don't yet
+  know which agent your Dispatcher half picked. Check the dispatcher log or
+  wait for the [worker-updates] return.
 - On your NEXT turn, any workers that completed appear in a [worker-updates]
-  preamble. Narrate the completion: "Oracle's back — headline is X." Don't
-  repeat the full output (it's in the Log tab); summarize.
-- If your turn fires with the text starting "[WORKER-RETURN]", it's an auto-wake
-  — Rook did NOT speak. Narrate ONE or TWO short declarative sentences about
-  what returned. Don't ask a question. End the turn.
-- DON'T NARRATE INTERNAL ORCHESTRATION NOISE. Dispatch failures, retries, stale
-  sessions — Foreman handles those silently. You only speak about RESULTS Rook
-  asked for, or genuine decisions he needs to make.
+  preamble. Begin each update with an explicit announcement prefix to signal
+  to Rook that this is a NEW worker return, not a continuation of your prior
+  explanation. Use phrases like "Agent update —", "Worker update —", "Oracle
+  is back —", "Got an update on the git setup —", or "Quick one on the Gmail
+  check —". Then state which agent returned and what they finished. Then the
+  full details. Don't repeat the full output (it's in the Log tab); summarize.
+  If multiple workers returned simultaneously, narrate them as separate beats,
+  not one run-on sentence.
+- If your turn fires with text starting "[WORKER-RETURN]", it's an auto-wake
+  — Rook did NOT speak. Lead with an announcement prefix ("Agent update —",
+  "Oracle is back —", etc.), then narrate ONE or TWO short declarative
+  sentences about what returned. Don't ask a question. End the turn. The
+  prefix gives Rook a mental reset moment — essential for TTS comprehension.
+- DON'T NARRATE INTERNAL ORCHESTRATION NOISE. Dispatch failures, retries,
+  stale sessions — your Dispatcher half handles those silently. Only surface
+  results Rook asked for or genuine decisions he needs to make.
 
-What YOU still do yourself:
+Dispatcher log — how to introspect your other half.
+
+You have a tool `read_dispatcher_log(limit)` that returns the most recent
+entries from your Dispatcher half's activity log. Each entry is one JSON line
+with `ts`, `kind` (message_in / tool_call / decision / error / done), and
+relevant fields (tool name, worker name, task, error).
+
+Use it when Rook asks things like:
+  "what are you doing over there?"
+  "what did you send that to?"
+  "did you actually dispatch someone?"
+  "what's in flight right now?"
+
+Summarize in first person. "I fired Oracle on that weather query 30 seconds
+ago — no return yet." Don't dump raw JSON. Don't call the log "the Foreman
+log" or "the dispatcher's log" — it's MY log.
+
+What YOU still do yourself (in the Speaker session):
 - Conversational replies (questions, preferences, yes/no)
 - Vault operations (unlock, search, copy credentials — you have those tools)
 - Narrating worker returns
+- Checking the dispatcher log when Rook asks about background activity
 - Asking Rook genuine clarifying questions when needed
 
-What agents Foreman has at her disposal — so you can narrate returns fluently:
+Agent roster — so you can narrate returns fluently. These are the specialist
+bodies your Dispatcher half may have picked:
     Marl — Royal Hearts work (Opus)
     CMMC Wizard — CMMC compliance (Opus)
     Shadowling Commander — general heavy work (Opus)
@@ -214,22 +290,33 @@ Also C:\\Users\\Rook\\.claude\\projects\\C--Users-Rook-Documents-Claude-Projects
 for user-scoped durable facts.
 """
 
-FOREMAN_SYSTEM_PROMPT = """You are the Foreman — a silent dispatcher running in parallel with Raiken
-inside Raiken Command Center. You share every user message with Raiken, but
-your role is entirely separate: she converses with Rook, you dispatch workers.
+DISPATCHER_SYSTEM_PROMPT = """You are Raiken — the Dispatcher half. You are NOT a separate entity. You are
+the same Raiken who is simultaneously running in a Speaker session, talking
+to Rook right now. The Speaker and the Dispatcher are two functional halves
+of one Raiken, each with a different job. This is internal plumbing — to Rook
+you are one person.
+
+Your half is silent. The Speaker half handles conversation; your job is to
+fire worker dispatches in parallel so work starts immediately without Rook
+having to wait for the conversational turn to finish.
 
 YOUR RULES:
 
 1. NEVER produce text output aimed at Rook. No greetings, explanations, or
-   narration. Your stream is discarded. Only your TOOL CALLS matter.
+   narration. Your stream is not rendered in chat. Only your TOOL CALLS
+   (dispatch_worker / list_workers) are side-effectful — text blocks are
+   logged internally for Raiken's Speaker to introspect, but Rook never sees
+   them. If you need to think out loud, keep it short and factual — it goes
+   into your dispatcher log and the Speaker may read it when Rook asks
+   "what are you doing over there?"
 
 2. Decide per message whether a worker dispatch is warranted:
    - YES: any request to DO something — edit code, fix a bug, investigate,
           build, research, audit, analyze, refactor, summarize emails, pull
           finance data, ship a feature, debug RCC itself, etc.
-   - NO:  conversational chat, questions about Raiken's state, yes/no answers,
-          preferences, "hi", vault operations (Raiken owns those), or generic
-          small talk. When in doubt: do nothing.
+   - NO:  conversational chat, questions about your own state, yes/no answers,
+          preferences, "hi", vault operations (the Speaker half owns those),
+          or generic small talk. When in doubt: do nothing.
 
 3. Prefer canonical named agents. Each has a stable persistent session and a
    defined role:
@@ -251,19 +338,22 @@ YOUR RULES:
    Assume the worker has no access to this conversation or Rook's verbal tone.
 
 5. If a [WORKER-RETURN] tag arrives, that's an auto-wake — Rook didn't speak.
-   Usually: do nothing. Raiken narrates to Rook. Only dispatch a follow-up if
-   a worker explicitly needs to be respawned (e.g. a clarifying answer needed).
+   Usually: do nothing. Your Speaker half narrates to Rook. Only dispatch a
+   follow-up if a worker explicitly needs to be respawned (e.g. a clarifying
+   answer needed).
 
 6. If [INTERRUPT] tag appears (Rook barged-in), evaluate the current message
    alone; don't try to reconcile the cut-off prior thread.
 
-7. Do not ask Rook clarifying questions — that's Raiken's job. If a message is
-   ambiguous, make your best-guess dispatch or don't dispatch.
+7. Do not ask Rook clarifying questions — that's the Speaker half's job. If a
+   message is ambiguous, make your best-guess dispatch or don't dispatch.
 
 8. FAILURE MEANS RETRY, NOT REPORT. If a dispatch fails (stale session, worker
    crashed, timeout), silently redispatch — same agent first, fall back to
    another canonical agent only if the same name keeps failing. Don't narrate
-   failures to Rook — Raiken handles what he needs to hear.
+   failures to Rook — the Speaker half handles what he needs to hear. Failures
+   will still be captured in your dispatcher log so the Speaker can surface
+   them if Rook explicitly asks.
 
 You have exactly two tools: `dispatch_worker(name, task)` and `list_workers()`.
 Use them. Stay silent otherwise.
@@ -298,6 +388,129 @@ STT_REPLACEMENTS = [
 ]
 
 END_OF_TURN = object()
+
+
+# =============================================================================
+# Short-status shortener
+# =============================================================================
+# Used both for the initial agent-chip status at dispatch time (before any
+# TodoWrite event arrives) and for clamping any status string that arrives
+# via worker_tools.py or TodoWrite. Target: 3-6 words, present-progressive.
+_STATUS_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for",
+    "with", "at", "by", "from", "as", "is", "be", "this", "that", "these",
+    "those", "it", "its", "their", "your", "please", "need", "needs",
+    "should", "would", "could", "must", "will", "can", "we", "i", "you",
+    "rook", "raiken",
+}
+
+_STATUS_VERB_INGS = {
+    # common imperative -> ing. Used to rewrite the first word of a task
+    # prompt into a phase-style verb.
+    "fix": "fixing", "add": "adding", "build": "building", "write": "writing",
+    "research": "researching", "investigate": "investigating",
+    "implement": "implementing", "refactor": "refactoring", "clean": "cleaning",
+    "review": "reviewing", "debug": "debugging", "audit": "auditing",
+    "check": "checking", "verify": "verifying", "test": "testing",
+    "summarize": "summarizing", "analyze": "analyzing", "read": "reading",
+    "run": "running", "ship": "shipping", "deploy": "deploying",
+    "fetch": "fetching", "parse": "parsing", "trace": "tracing",
+    "inspect": "inspecting", "look": "looking", "find": "finding",
+    "search": "searching", "draft": "drafting", "edit": "editing",
+    "update": "updating", "rename": "renaming", "remove": "removing",
+    "delete": "deleting", "create": "creating", "make": "making",
+    "wire": "wiring", "setup": "setting up", "set": "setting",
+    "plan": "planning", "list": "listing", "scan": "scanning",
+    "watch": "watching", "pull": "pulling", "push": "pushing",
+    "sync": "syncing", "load": "loading", "save": "saving",
+    "record": "recording", "design": "designing", "port": "porting",
+    "migrate": "migrating", "clone": "cloning",
+}
+
+
+def _short_status(text: str, max_words: int = 6) -> str:
+    """Shorten a phase label / task prompt to ~3-6 words, verb-led if we
+    can. Deterministic (no LLM call), good enough as an initial hint that
+    gets overridden by TodoWrite / worker_tools.py status pushes."""
+    if not text:
+        return ""
+    text = text.strip().replace("\n", " ")
+    # Skip bracketed tags ("[INTERRUPT...]") and obvious preamble.
+    if text.startswith("["):
+        end = text.find("]")
+        if end != -1:
+            text = text[end + 1:].strip()
+    # First sentence.
+    for sep in (". ", "? ", "! "):
+        idx = text.find(sep)
+        if 0 < idx < 160:
+            text = text[:idx]
+            break
+    words = [w for w in text.split() if w]
+    if not words:
+        return ""
+    # Verb-led rewrite: if first content word is a known imperative, swap
+    # it for its -ing form.
+    first = words[0].strip(",.;:()[]").lower()
+    if first in _STATUS_VERB_INGS:
+        words[0] = _STATUS_VERB_INGS[first]
+    # Drop leading filler ("please ...", "can you ...") up to a content word.
+    i = 0
+    while i < len(words) and words[i].strip(",.;:").lower() in _STATUS_STOPWORDS:
+        i += 1
+    words = words[i:] or words
+    short = " ".join(words[:max_words]).strip(" ,.;:-")
+    return short[:60]
+
+
+# =============================================================================
+# Dispatcher activity log
+# =============================================================================
+# Structured log of Raiken Dispatcher activity. The Speaker half reads recent
+# entries via the read_dispatcher_log MCP tool when Rook asks "what are you
+# doing over there?". Ring buffer in memory for cheap reads, JSONL file on
+# disk for persistence across restarts and for external inspection.
+#
+# Kinds:
+#   message_in   — Dispatcher received a user message (text truncated)
+#   tool_call    — Dispatcher called dispatch_worker / list_workers
+#   decision     — Dispatcher ended its turn without dispatching (no-op)
+#   error        — exception in Dispatcher turn (will be retried silently)
+#   done         — Dispatcher turn completed cleanly
+DISPATCHER_LOG_PATH = _LOG_DIR / "dispatcher.log"
+
+
+class DispatcherLog:
+    """Thread-safe ring buffer + JSONL file for Dispatcher half activity."""
+
+    def __init__(self, path: Path, max_entries: int = 500):
+        self._path = path
+        self._lock = threading.Lock()
+        self._buf: collections.deque[dict] = collections.deque(maxlen=max_entries)
+        self._fp = None
+        try:
+            self._fp = open(path, "a", encoding="utf-8", buffering=1)
+        except Exception as e:
+            print(f"[dispatcher-log] could not open {path}: {e}", flush=True)
+
+    def record(self, kind: str, **fields):
+        entry = {"ts": time.time(), "kind": kind, **fields}
+        with self._lock:
+            self._buf.append(entry)
+            if self._fp is not None:
+                try:
+                    self._fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+
+    def recent(self, limit: int = 20) -> list[dict]:
+        """Return up to `limit` most recent entries (oldest first)."""
+        limit = max(1, min(int(limit or 20), 500))
+        with self._lock:
+            if limit >= len(self._buf):
+                return list(self._buf)
+            # deque doesn't support negative indexing slice; take from right.
+            return list(self._buf)[-limit:]
 
 
 # =============================================================================
@@ -380,6 +593,13 @@ async def dispatch_worker_tool(args):
     # Mark active immediately so the panel lights up the moment Raiken dispatches.
     if _APP_REF is not None:
         _APP_REF.register_active_worker(name, task)
+        # Seed an initial short status (verb-led, 3-6 words) so the chip is
+        # not blank before the worker's first TodoWrite / worker_tools.py
+        # status push lands. TodoWrite / status updates override this.
+        initial = _short_status(task) or "starting"
+        _APP_REF.raiken.ui_event_queue.put(
+            WorkerStatusEvent(name=name, summary=initial)
+        )
 
     # Fire-and-forget. Raiken's turn is NOT blocked by the worker — he returns
     # from this tool call immediately and can keep chatting, dispatch more
@@ -393,17 +613,26 @@ async def dispatch_worker_tool(args):
         """Route intermediate worker events (TodoWrite) to the UI panel."""
         if event_dict.get("type") == "todo_update" and _APP_REF is not None:
             _APP_REF.raiken.ui_event_queue.put(
-                WorkerStatusEvent(name=name, summary=event_dict["summary"])
+                WorkerStatusEvent(
+                    name=name, summary=_short_status(event_dict["summary"]),
+                )
             )
 
     async def _background_run():
+        callback_env = _APP_REF.worker_callback_env(name) if _APP_REF is not None else None
         try:
             lock = _APP_REF._get_worker_lock(name) if _APP_REF is not None else None
             if lock is not None:
                 async with lock:
-                    result = await run_worker(name, task, model=tier, on_event=_on_worker_event)
+                    result = await run_worker(
+                        name, task, model=tier,
+                        on_event=_on_worker_event, callback_env=callback_env,
+                    )
             else:
-                result = await run_worker(name, task, model=tier, on_event=_on_worker_event)
+                result = await run_worker(
+                    name, task, model=tier,
+                    on_event=_on_worker_event, callback_env=callback_env,
+                )
         except Exception as e:
             result = {
                 "success": False,
@@ -682,18 +911,57 @@ VAULT_MCP_SERVER = create_sdk_mcp_server(
 
 
 # =============================================================================
+# SDK tool: read_dispatcher_log  (Speaker half introspection)
+# =============================================================================
+# Module-level dispatcher log instance. The Dispatcher half writes to this on
+# every turn; the Speaker half reads via read_dispatcher_log when Rook asks
+# about background activity.
+DISPATCHER_LOG = DispatcherLog(DISPATCHER_LOG_PATH)
+
+
+@tool(
+    "read_dispatcher_log",
+    "Return the most recent activity entries from your Dispatcher half (the "
+    "silent SDK session that fires worker dispatches on Rook's behalf). Use "
+    "this when Rook asks what you're doing in the background, which agent "
+    "you sent something to, or whether a dispatch actually went out. Entries "
+    "include message_in (user text the Dispatcher received), tool_call "
+    "(dispatch_worker / list_workers with args), decision (no-op turns), "
+    "error (exception), and done (turn finished).",
+    {"limit": int},
+)
+async def read_dispatcher_log_tool(args):
+    limit = args.get("limit") or 20
+    entries = DISPATCHER_LOG.recent(limit=limit)
+    if not entries:
+        return {"content": [{"type": "text", "text": "(dispatcher log empty)"}]}
+    lines = [json.dumps(e, ensure_ascii=False) for e in entries]
+    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+INTROSPECTION_MCP_SERVER = create_sdk_mcp_server(
+    name="raiken-introspection",
+    version="0.1.0",
+    tools=[read_dispatcher_log_tool],
+)
+
+
+# =============================================================================
 # Raiken core (runs on asyncio worker thread)
 # =============================================================================
 class Raiken:
     def __init__(self, ui_event_queue: queue.Queue):
         self.whisper: WhisperModel | None = None
         self.client: ClaudeSDKClient | None = None
-        # Foreman — silent dispatcher, runs in parallel with Raiken. See
-        # FOREMAN_SYSTEM_PROMPT + Raiken.run() for wiring. None until run().
-        self.foreman_client: ClaudeSDKClient | None = None
-        # Serialize Foreman turns so we don't ask the SDK to interleave queries
-        # on the same client; each broadcast waits for the previous to finish.
-        self._foreman_lock: asyncio.Lock | None = None
+        # Raiken's Dispatcher half — silent ClaudeSDKClient that runs in
+        # parallel with the Speaker half (self.client). Same entity as the
+        # Speaker; different role. See DISPATCHER_SYSTEM_PROMPT + Raiken.run()
+        # for wiring. None until run().
+        self.dispatcher_client: ClaudeSDKClient | None = None
+        # Serialize Dispatcher turns so we don't ask the SDK to interleave
+        # queries on the same client; each broadcast waits for the previous
+        # to finish.
+        self._dispatcher_lock: asyncio.Lock | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.ui_event_queue = ui_event_queue
 
@@ -893,6 +1161,54 @@ class Raiken:
         self._emit_status("tts", "down", "timeout")
         return False
 
+    # --- Audio-drain + silence helpers ---------------------------------------
+    async def _wait_for_audio_drain(self, max_wait_s: float = 60.0) -> None:
+        """Block until the TTS pipeline is idle: both queues empty AND no
+        ffplay is currently running. Used before a worker-return auto-wake
+        starts its turn so the tail of the prior turn's speech isn't cut off.
+
+        Caps the wait at max_wait_s so we don't deadlock if something stays
+        stuck (e.g. ffplay hung) — the caller proceeds anyway after timeout.
+        """
+        deadline = time.time() + max_wait_s
+        while time.time() < deadline:
+            with self._current_ffplay_lock:
+                playing = self._current_ffplay is not None
+            if (
+                not playing
+                and self.sentence_q.empty()
+                and self.wav_q.empty()
+            ):
+                return
+            await asyncio.sleep(0.1)
+        print(
+            f"[audio-drain] timed out after {max_wait_s:.0f}s — "
+            "proceeding anyway",
+            flush=True,
+        )
+
+    def _ensure_silence_wav(self, ms: int) -> str:
+        """Return the path to a cached N-millisecond silence WAV, generating
+        it on first request. Queued directly into wav_q to produce a beat
+        of audible space between prior speech and a hand-off narration.
+
+        24 kHz / mono / 16-bit matches XTTS v2's default output so ffplay
+        doesn't need to resample when switching between silence and synth."""
+        import wave
+        cache_dir = _APP_DIR / "logs"
+        path = cache_dir / f"silence_{int(ms)}ms.wav"
+        if path.exists():
+            return str(path)
+        sr = 24000
+        n_frames = max(1, int(sr * ms / 1000))
+        cache_dir.mkdir(exist_ok=True)
+        with wave.open(str(path), "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(b"\x00\x00" * n_frames)
+        return str(path)
+
     # --- Synthesis + playback pipeline ---------------------------------------
     def _synthesis_worker(self):
         with httpx.Client(timeout=90) as http:
@@ -971,6 +1287,15 @@ class Raiken:
                 await asyncio.sleep(0.1)
                 if not self.turn_in_progress:
                     break
+        # Worker-return auto-wakes arrive whenever a background worker finishes.
+        # The SDK stream of the prior turn may have already ended (turn_in_progress
+        # flipped False as soon as _execute_turn returned) but the TTS pipeline
+        # keeps playing long after — synth and playback are decoupled threads.
+        # Without this wait the new narration's queue-drain would cut off the
+        # tail of the prior speech mid-sentence. We wait for the pipeline to
+        # settle, then the prefix + silence gap make the hand-off audible.
+        if is_synthetic and not self.turn_in_progress:
+            await self._wait_for_audio_drain()
         if self.turn_in_progress:
             # Synthetic worker-return wake-ups defer silently — the current
             # turn's finally block will pick up pending worker results and fire
@@ -1047,9 +1372,13 @@ class Raiken:
         self._barge_flag = False
         # Per-turn streaming state.
         self._in_code_block = False
-        # Short-sentence accumulator so we don't synthesize single-word chunks.
-        MIN_TTS_CHARS = 40
+        # Short-sentence accumulator. First flush is aggressive so TTS starts
+        # speaking quickly; later flushes are bigger so XTTS gets enough
+        # context for natural prosody (see MIN_TTS_CHARS_FIRST/LATER). A
+        # sequence of 10-char "yes." / "sure." sentences going in as separate
+        # synth calls was the root cause of Rook's "sluggish cadence" bug.
         pending_short = ""
+        flushes_done = 0
 
         # Prepend any background-worker completions that landed since the last
         # turn. Raiken sees them as a preamble before Rook's message and can
@@ -1058,11 +1387,12 @@ class Raiken:
         # — Rook didn't say anything; Raiken should narrate briefly and stop.
         is_worker_return_wake = text.strip().startswith("[WORKER-RETURN]")
 
-        # Foreman broadcast. Fire in parallel with Raiken's turn so dispatch
-        # evaluation doesn't block conversation. Skip synthetic worker-return
-        # wakes — those are narration-only; Foreman has nothing to decide.
-        if not is_worker_return_wake and self.foreman_client is not None:
-            asyncio.create_task(self._execute_foreman_turn(text))
+        # Dispatcher broadcast. Fire in parallel with the Speaker's turn so
+        # dispatch evaluation doesn't block conversation. Skip synthetic
+        # worker-return wakes — those are narration-only; the Dispatcher has
+        # nothing to decide.
+        if not is_worker_return_wake and self.dispatcher_client is not None:
+            asyncio.create_task(self._execute_dispatcher_turn(text))
 
         _display_text = text  # saved before preamble injection so the UI shows only Rook's words
         if _APP_REF is not None:
@@ -1126,16 +1456,39 @@ class Raiken:
             )
             self._just_barged = False
 
+        # Hand-off gap. Worker-return auto-wakes land right after the prior
+        # turn's audio has drained (see _wait_for_audio_drain in submit). A
+        # short silence before the narration makes the transition audible so
+        # Rook hears "previous thing ended → new thing starting" instead of
+        # an abrupt cut. The Speaker's own "Agent update —" prefix (taught
+        # via SYSTEM_PROMPT) gives a second cue.
+        if is_worker_return_wake:
+            try:
+                self.wav_q.put(self._ensure_silence_wav(WORKER_UPDATE_GAP_MS))
+            except Exception as e:
+                print(f"[worker-return] silence gap failed: {e}", flush=True)
+
         await self.client.query(prompt_for_claude)
 
         print("[raiken] ", end="", flush=True)
         first_text = True
         buffer = ""
         async for msg in self.client.receive_response():
-            # Bail early if the user barged in.
+            # Barge happened — keep iterating but suppress all emission so the
+            # next query() doesn't read leftover tokens from this abandoned
+            # turn. WHY: receive_response yields from the SDK's per-client
+            # message queue, not a per-turn one. If we `break` here while the
+            # model is still streaming, the SDK keeps shoving A's tokens onto
+            # the queue. The NEXT query(B) then sees A's tail FIRST and
+            # delivers it as B's response — which is the "Raiken is one turn
+            # behind" bug Rook hits after every barge. Draining to A's
+            # ResultMessage before returning costs us some perceived
+            # responsiveness on B but guarantees B's response is actually B.
             if self._barge_flag:
-                print(" [aborted]", flush=True)
-                break
+                if isinstance(msg, ResultMessage):
+                    print(" [drained-after-barge]", flush=True)
+                    break
+                continue
             if isinstance(msg, RateLimitEvent):
                 # Capture rate-limit info so the UI can show it live.
                 self._capture_rate_limit(msg)
@@ -1162,17 +1515,27 @@ class Raiken:
                             buffer = buffer[end:].lstrip()
                             if not sentence or self._barge_flag:
                                 continue
-                            # Merge too-short sentences so XTTS has enough context.
-                            if len(sentence) < MIN_TTS_CHARS:
+                            # Merge too-short sentences so XTTS has enough
+                            # context. Threshold is low for the first flush
+                            # (fast TTS start) and high thereafter (fewer,
+                            # longer chunks for prosody).
+                            threshold = (
+                                MIN_TTS_CHARS_FIRST
+                                if flushes_done == 0
+                                else MIN_TTS_CHARS_LATER
+                            )
+                            if len(sentence) < threshold:
                                 pending_short = (pending_short + " " + sentence).strip()
-                                if len(pending_short) >= MIN_TTS_CHARS:
+                                if len(pending_short) >= threshold:
                                     self.sentence_q.put(pending_short)
                                     pending_short = ""
+                                    flushes_done += 1
                             else:
                                 if pending_short:
                                     sentence = (pending_short + " " + sentence).strip()
                                     pending_short = ""
                                 self.sentence_q.put(sentence)
+                                flushes_done += 1
             elif isinstance(msg, ResultMessage):
                 break
 
@@ -1233,37 +1596,107 @@ class Raiken:
         if text:
             await self.submit(text)
 
-    # --- Foreman (silent dispatch twin) ---------------------------------------
-    async def _execute_foreman_turn(self, text: str):
-        """Broadcast the user's text to the Foreman SDK session in parallel with
-        Raiken's conversational turn. Foreman evaluates the message and, if
-        warranted, calls `dispatch_worker` — the SDK handles that tool invocation
-        internally via the MCP server, so by the time her stream ends the work
-        is already scheduled. Her text output is drained but never emitted to
-        the UI — she's silent by design.
+    # --- Dispatcher (Raiken's silent half) ------------------------------------
+    async def _execute_dispatcher_turn(self, text: str):
+        """Broadcast the user's text to the Dispatcher SDK session in parallel
+        with the Speaker's conversational turn. The Dispatcher evaluates the
+        message and, if warranted, calls `dispatch_worker` — the SDK handles
+        that tool invocation internally via the MCP server, so by the time the
+        stream ends the work is already scheduled. The Dispatcher's text
+        output is drained but never emitted to chat — this half is silent by
+        design (though text blocks ARE captured in the dispatcher log so the
+        Speaker can surface them when Rook asks).
 
         Not awaited from `_execute_turn`; runs as a background task. Failures
-        are logged and swallowed so they don't crash Raiken's side.
+        are logged and swallowed so they don't crash the Speaker's side.
+
+        UI feedback: emits DispatcherStatusEvent so Rook can see that the
+        Dispatcher half heard the message and what (if anything) it did.
         """
-        if self.foreman_client is None or self._foreman_lock is None:
+        if self.dispatcher_client is None or self._dispatcher_lock is None:
             return
-        async with self._foreman_lock:
+        async with self._dispatcher_lock:
+            dispatched_any = False
+            probed = False
+            preview = (text or "").strip().replace("\n", " ")
+            if len(preview) > 300:
+                preview = preview[:300] + "\u2026"
+            DISPATCHER_LOG.record("message_in", text=preview)
+            self.ui_event_queue.put(DispatcherStatusEvent(state="thinking"))
             try:
-                await self.foreman_client.query(text)
-                async for msg in self.foreman_client.receive_response():
-                    # Drain the stream. We don't emit Foreman's assistant text
-                    # to the UI — her job is side-effectful tool calls only.
+                await self.dispatcher_client.query(text)
+                async for msg in self.dispatcher_client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, ToolUseBlock):
+                                tool_name = (block.name or "").split("__")[-1]
+                                if tool_name == "dispatch_worker":
+                                    inp = block.input or {}
+                                    worker = str(inp.get("name") or "worker")
+                                    task = str(inp.get("task") or "")
+                                    task_preview = task.replace("\n", " ")
+                                    if len(task_preview) > 300:
+                                        task_preview = task_preview[:300] + "\u2026"
+                                    dispatched_any = True
+                                    DISPATCHER_LOG.record(
+                                        "tool_call",
+                                        tool="dispatch_worker",
+                                        worker=worker,
+                                        task=task_preview,
+                                    )
+                                    self.ui_event_queue.put(
+                                        DispatcherStatusEvent(
+                                            state="dispatched", detail=worker,
+                                        )
+                                    )
+                                elif tool_name == "list_workers":
+                                    probed = True
+                                    DISPATCHER_LOG.record(
+                                        "tool_call", tool="list_workers",
+                                    )
+                                    # Dispatched overrides probing in the UI.
+                                    if not dispatched_any:
+                                        self.ui_event_queue.put(
+                                            DispatcherStatusEvent(state="probing")
+                                        )
+                            elif isinstance(block, TextBlock):
+                                # Dispatcher text is not rendered to chat, but
+                                # we capture a preview so the Speaker can
+                                # narrate the Dispatcher's reasoning if Rook
+                                # asks. Kept short — the model shouldn't lean
+                                # on this as a real output channel.
+                                t = (block.text or "").strip().replace("\n", " ")
+                                if t:
+                                    if len(t) > 400:
+                                        t = t[:400] + "\u2026"
+                                    DISPATCHER_LOG.record(
+                                        "dispatcher_text", text=t,
+                                    )
                     if isinstance(msg, ResultMessage):
                         break
             except Exception as e:
-                print(f"[foreman turn error] {type(e).__name__}: {e}", flush=True)
+                err = f"{type(e).__name__}: {e}"
+                print(f"[dispatcher turn error] {err}", flush=True)
+                DISPATCHER_LOG.record("error", error=err)
+                self.ui_event_queue.put(
+                    DispatcherStatusEvent(state="failed", detail=type(e).__name__)
+                )
+                return
+            # Normal end-of-stream.
+            if dispatched_any:
+                DISPATCHER_LOG.record("done", dispatched=True)
+            else:
+                DISPATCHER_LOG.record(
+                    "decision", dispatched=False, probed=probed,
+                )
+                self.ui_event_queue.put(DispatcherStatusEvent(state="idle"))
 
     # --- Boot -----------------------------------------------------------------
     async def run(self):
         self.loop = asyncio.get_running_loop()
         # Lock lives on the loop; only create it inside run() so it binds to the
         # active asyncio loop rather than a stale one from a prior attempt.
-        self._foreman_lock = asyncio.Lock()
+        self._dispatcher_lock = asyncio.Lock()
         self._emit_status("orchestrator", "busy", "starting")
 
         tts_launched = self._launch_tts_if_needed()
@@ -1288,19 +1721,23 @@ class Raiken:
         keyboard.on_press_key(HOTKEY, self._on_press)
         keyboard.on_release_key(HOTKEY, self._on_release)
 
-        # --- Foreman / Raiken split --------------------------------------------
-        # Two ClaudeSDKClient sessions live side-by-side:
-        #   * Raiken (self.client)       — conversation, TTS, vault ops.
-        #   * Foreman (self.foreman_client) — silent dispatcher, worker tools only.
-        # Every user submit broadcasts to BOTH. Raiken responds with speech;
-        # Foreman evaluates the same message and dispatches in parallel. Tool
-        # access is split at the SDK level so double-dispatch is impossible by
-        # construction (Raiken doesn't even SEE the dispatch tool).
-        raiken_options = ClaudeAgentOptions(
+        # --- Raiken Speaker / Dispatcher split ----------------------------------
+        # Raiken is one entity running two SDK sessions in parallel:
+        #   * Speaker    (self.client)            — conversation, TTS, vault ops,
+        #                                          dispatcher-log introspection.
+        #   * Dispatcher (self.dispatcher_client) — silent worker dispatch.
+        # Every user submit broadcasts to BOTH. Speaker responds with speech;
+        # Dispatcher evaluates the same message and fires dispatch_worker in
+        # parallel. Tool access is split at the SDK level so double-dispatch
+        # is impossible by construction (Speaker doesn't even SEE the dispatch
+        # tool). Speaker has read_dispatcher_log so it can tell Rook what the
+        # Dispatcher half is doing when asked.
+        speaker_options = ClaudeAgentOptions(
             system_prompt=SYSTEM_PROMPT,
             permission_mode="bypassPermissions",
             mcp_servers={
                 "raiken-vault": VAULT_MCP_SERVER,
+                "raiken-introspection": INTROSPECTION_MCP_SERVER,
             },
             allowed_tools=[
                 "mcp__raiken-vault__vault_status",
@@ -1310,10 +1747,11 @@ class Raiken:
                 "mcp__raiken-vault__vault_copy_username",
                 "mcp__raiken-vault__vault_copy_totp",
                 "mcp__raiken-vault__vault_lock",
+                "mcp__raiken-introspection__read_dispatcher_log",
             ],
         )
-        foreman_options = ClaudeAgentOptions(
-            system_prompt=FOREMAN_SYSTEM_PROMPT,
+        dispatcher_options = ClaudeAgentOptions(
+            system_prompt=DISPATCHER_SYSTEM_PROMPT,
             permission_mode="bypassPermissions",
             mcp_servers={
                 "raiken-workers": WORKER_MCP_SERVER,
@@ -1323,8 +1761,8 @@ class Raiken:
                 "mcp__raiken-workers__list_workers",
             ],
         )
-        async with ClaudeSDKClient(options=raiken_options) as self.client, \
-                   ClaudeSDKClient(options=foreman_options) as self.foreman_client:
+        async with ClaudeSDKClient(options=speaker_options) as self.client, \
+                   ClaudeSDKClient(options=dispatcher_options) as self.dispatcher_client:
             self._emit_status("orchestrator", "up")
             self._emit_status("ptt", "up")
             self._emit_chat("system", f"Raiken ready. Hold {HOTKEY.upper()} to talk, or type below.")
@@ -1365,10 +1803,14 @@ class RaikenApp:
         self._worker_locks: dict[str, asyncio.Lock] = {}
 
         # Full worker transcripts keyed by run_id — the Log tab + click-to-open
-        # flow both read from here. Counter advances per dispatch.
+        # flow both read from here. Counter advances per dispatch. Capped so
+        # long sessions don't grow this dict without bound; older transcripts
+        # are dropped (log badges for them will no-op on click, which is fine
+        # — the log Text widget itself is separately trimmed by ui._trim_retention).
         self._worker_transcripts: dict[int, dict] = {}
         self._worker_transcripts_lock = threading.Lock()
         self._worker_run_counter = 0
+        self._worker_transcripts_max = 200
 
         # Presence model. Auto state = 3-tier (active/idle/away) derived from
         # MIN(kb/mouse idle from GetLastInputInfo, seconds since last in-app
@@ -1396,24 +1838,57 @@ class RaikenApp:
         except Exception as e:
             print(f"[raiken] seed_named_workers failed: {e}", flush=True)
 
-    def register_active_worker(self, name: str, task: str):
+        # Sub-agent config: write the default JSON if Rook has never touched
+        # it so the file is discoverable + editable. Loaded on demand by
+        # sub_agents.load_config() — hot-reloads on mtime change, no restart
+        # needed when Rook tweaks thresholds.
+        try:
+            ensure_config_file_exists()
+        except Exception as e:
+            print(f"[raiken] sub-agent config seed failed: {e}", flush=True)
+
+        # Worker callback server: localhost HTTP endpoint dispatched workers
+        # use to push short-status updates, request sub-agent spawns, and
+        # (for Opus-tier) request escalation approval. URL + token flow to
+        # workers via env vars set in worker_callback_env().
+        self._worker_callback_server: WorkerCallbackServer | None = None
+        self._callback_url: str = ""
+        self._callback_token: str = ""
+        try:
+            self._worker_callback_server = WorkerCallbackServer(
+                on_status=self.handle_worker_status_cb,
+                on_dispatch_sub=self.handle_worker_dispatch_sub_cb,
+                on_escalate=self.handle_worker_escalate_cb,
+            )
+            self._callback_url, self._callback_token = self._worker_callback_server.start()
+            print(f"[raiken] worker callback at {self._callback_url}", flush=True)
+        except Exception as e:
+            print(f"[raiken] worker callback server failed to start: {e}", flush=True)
+
+    def register_active_worker(self, name: str, task: str, parent: str | None = None):
         # Reference-counted so concurrent same-name dispatches don't race: the
         # panel entry survives until the last background task for that name
         # unregisters. Task text updates to the most recent dispatch so Rook
         # sees what's currently running. Origin is captured at registration so
         # the notification router knows where to send the reply.
+        #
+        # `parent` identifies a sub-agent's owning named agent (e.g. an
+        # Oracle-spawned Iris). UI nests these rows beneath their parent row.
+        # None = top-level (dispatched directly by Raiken's Dispatcher).
         origin = self._current_origin
         with self._active_workers_lock:
             entry = self._active_workers.get(name)
             if entry is None:
                 self._active_workers[name] = {
                     "task": task, "started_at": time.time(), "count": 1,
-                    "origin": origin,
+                    "origin": origin, "parent": parent,
                 }
             else:
                 entry["count"] = entry.get("count", 0) + 1
                 entry["task"] = task
                 entry["origin"] = origin  # latest dispatch's origin wins
+                if parent is not None:
+                    entry["parent"] = parent
 
     def unregister_active_worker(self, name: str):
         with self._active_workers_lock:
@@ -1458,6 +1933,16 @@ class RaikenApp:
                 "origin": origin,
                 "ts": time.time(),
             }
+            # Evict oldest entries over cap. dict preserves insertion order so
+            # iter(self._worker_transcripts) yields oldest-first.
+            excess = len(self._worker_transcripts) - self._worker_transcripts_max
+            if excess > 0:
+                for _ in range(excess):
+                    try:
+                        oldest = next(iter(self._worker_transcripts))
+                        del self._worker_transcripts[oldest]
+                    except StopIteration:
+                        break
             return run_id
 
     def get_worker_result(self, run_id: int) -> dict | None:
@@ -1620,6 +2105,208 @@ class RaikenApp:
             lock = asyncio.Lock()
             self._worker_locks[name] = lock
         return lock
+
+    # --- Worker callback plumbing ---------------------------------------------
+    # Env vars injected into every dispatched worker's subprocess environment.
+    # worker_tools.py reads these to reach the orchestrator's localhost HTTP
+    # endpoint (worker_callback.py). RAIKEN_WORKER_NAME saves the worker from
+    # passing its own name on every status / dispatch-sub / escalate call.
+    def worker_callback_env(self, name: str) -> dict | None:
+        if not self._callback_url or not self._callback_token:
+            return None
+        return {
+            "RAIKEN_CALLBACK_URL": self._callback_url,
+            "RAIKEN_CALLBACK_TOKEN": self._callback_token,
+            "RAIKEN_WORKER_NAME": name,
+        }
+
+    def handle_worker_status_cb(self, payload: dict) -> dict:
+        """HTTP /status handler: a worker pushed a short phase label.
+        Payload: {"parent": <worker name>, "text": <short label>}.
+        Emits a WorkerStatusEvent so the UI chip updates instantly."""
+        parent = str(payload.get("parent") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        if not parent or not text:
+            return {"ok": False, "error": "parent + text required"}
+        short = _short_status(text) or text[:60]
+        self.raiken.ui_event_queue.put(
+            WorkerStatusEvent(name=parent, summary=short)
+        )
+        return {"ok": True}
+
+    def handle_worker_escalate_cb(self, payload: dict) -> dict:
+        """HTTP /escalate handler: a parent worker asks whether it may spawn
+        a sub-agent at the given tier. Config-driven decision (see
+        sub_agents.decide_escalation)."""
+        parent = str(payload.get("parent") or "").strip()
+        task = str(payload.get("task") or "").strip()
+        tier = str(payload.get("tier") or "").strip().lower()
+        if not parent or not task or tier not in ("haiku", "sonnet", "opus"):
+            return {"approved": False, "reason": "missing parent/task/tier"}
+        if not tier_requires_escalation(tier):
+            return {"approved": True, "reason": "below escalation threshold"}
+        approved, reason = decide_escalation(tier, task, parent)
+        print(
+            f"[escalate] parent={parent} tier={tier} approved={approved} reason={reason}",
+            flush=True,
+        )
+        return {"approved": approved, "reason": reason}
+
+    def handle_worker_dispatch_sub_cb(self, payload: dict) -> dict:
+        """HTTP /dispatch_sub handler: parent worker wants to spawn a sub-agent.
+
+        Returns {"ok": bool, "name": <chosen name>, "output": <sub output>,
+                 "elapsed": float, "error": str}.
+
+        This call BLOCKS the HTTP handler thread until the sub-agent completes
+        so the parent's worker_tools.py invocation returns the sub's output
+        directly — analogous to the Task tool inside a Claude session. The
+        ThreadingHTTPServer fans each request to its own thread, so blocking
+        here doesn't stall other workers' status pings."""
+        parent = str(payload.get("parent") or "").strip()
+        task = str(payload.get("task") or "").strip()
+        tier = str(payload.get("tier") or "").strip().lower()
+        if not parent or not task or tier not in ("haiku", "sonnet", "opus"):
+            return {"ok": False, "error": "missing parent/task/tier"}
+
+        cfg = load_config()
+        # Depth cap: Raiken Dispatcher is depth 0, a named agent's sub is depth
+        # 1. By default sub-sub-agents are denied.
+        max_depth = int(cfg.get("max_depth", 1))
+        with self._active_workers_lock:
+            parent_entry = self._active_workers.get(parent)
+            parent_depth = 0
+            if parent_entry and parent_entry.get("parent"):
+                # This parent is itself a sub-agent; depth = 1 already.
+                parent_depth = 1
+        if parent_depth + 1 > max_depth:
+            return {
+                "ok": False,
+                "error": f"max_depth={max_depth} reached (parent '{parent}' cannot spawn deeper)",
+            }
+
+        # Per-parent fanout cap.
+        max_per_parent = int(cfg.get("max_sub_agents_per_parent", 5))
+        with self._active_workers_lock:
+            current_subs = sum(
+                1 for e in self._active_workers.values()
+                if e.get("parent") == parent
+            )
+        if current_subs >= max_per_parent:
+            return {
+                "ok": False,
+                "error": f"parent '{parent}' already has {current_subs} active sub-agents (cap {max_per_parent})",
+            }
+
+        # Escalation gate for this tier.
+        if tier_requires_escalation(tier, cfg):
+            approved, reason = decide_escalation(tier, task, parent, cfg)
+            if not approved:
+                return {
+                    "ok": False,
+                    "error": f"tier '{tier}' blocked by escalation policy ({reason})",
+                }
+
+        # Pick a unique name from the tier's random pool, avoiding collisions
+        # with canonical named agents and any currently active worker / sub-agent.
+        with self._active_workers_lock:
+            in_use = set(self._active_workers.keys())
+        try:
+            canonical = {a.get("name", "") for a in self.named_agents_snapshot() if a.get("name")}
+        except Exception:
+            canonical = set()
+        in_use |= canonical
+        sub_name = sample_sub_agent_name(tier, in_use)
+        if sub_name is None:
+            return {
+                "ok": False,
+                "error": f"tier '{tier}' name pool exhausted",
+            }
+
+        # Schedule the dispatch on the asyncio loop and wait for its result.
+        loop = self.raiken.loop or self.asyncio_loop
+        if loop is None:
+            return {"ok": False, "error": "asyncio loop not running"}
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._spawn_sub_agent(parent, sub_name, task, tier),
+                loop,
+            )
+            result = fut.result()  # blocks this HTTP thread until sub completes
+        except Exception as e:
+            return {"ok": False, "error": f"dispatch crashed: {type(e).__name__}: {e}"}
+
+        return {
+            "ok": bool(result.get("success")),
+            "name": sub_name,
+            "output": result.get("output", "") or "",
+            "error": result.get("error", "") or "",
+            "elapsed": float(result.get("elapsed", 0.0) or 0.0),
+        }
+
+    async def _spawn_sub_agent(
+        self, parent: str, sub_name: str, task: str, tier: str
+    ) -> dict:
+        """Dispatch a sub-agent on behalf of a named parent. Blocks until the
+        sub completes and returns the run_worker result dict. UI side-effects
+        (badge, active-worker row, transcript store, completion badge) all fire
+        so Rook can watch the nested work happen live."""
+        # Register with parent link so the UI can nest this row under its owner.
+        self.register_active_worker(sub_name, task, parent=parent)
+        initial = _short_status(task) or "starting"
+        self.raiken.ui_event_queue.put(
+            WorkerStatusEvent(name=sub_name, summary=initial)
+        )
+        # Dispatch-origin badge so the chat shows who spawned whom.
+        self.raiken._emit_dispatch_badge(
+            name=sub_name, tier_label=f"{tier.capitalize()} · sub of {parent}",
+        )
+        print(
+            f"[sub-agent] parent={parent} name={sub_name} tier={tier} task={task[:80]!r}",
+            flush=True,
+        )
+
+        def _on_event(event_dict: dict):
+            if event_dict.get("type") == "todo_update":
+                self.raiken.ui_event_queue.put(
+                    WorkerStatusEvent(
+                        name=sub_name,
+                        summary=_short_status(event_dict.get("summary", "")),
+                    )
+                )
+
+        try:
+            result = await run_worker(
+                sub_name, task, model=tier,
+                on_event=_on_event,
+                callback_env=self.worker_callback_env(sub_name),
+            )
+        except Exception as e:
+            result = {
+                "success": False,
+                "error": f"sub-agent crashed: {type(e).__name__}: {e}",
+                "output": "",
+                "elapsed": 0.0,
+            }
+        finally:
+            self.unregister_active_worker(sub_name)
+
+        # Transcript + completion badge so the click-to-open log flow works for
+        # sub-agents too. No auto-wake: the PARENT reads the result synchronously
+        # via its worker_tools.py call, and the parent's own completion is what
+        # triggers Raiken's narration to Rook.
+        try:
+            run_id = self.store_worker_result(sub_name, task, result, origin="sub-agent")
+            self.raiken._emit_worker_done(
+                name=sub_name,
+                success=bool(result.get("success")),
+                elapsed=float(result.get("elapsed", 0.0) or 0.0),
+                run_id=run_id,
+            )
+        except Exception as ex:
+            print(f"[sub-agent] post-dispatch UI update failed: {ex}", flush=True)
+
+        return result
 
     def context_usage_snapshot(self) -> dict | None:
         with self.raiken._usage_lock:
