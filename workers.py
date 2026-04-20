@@ -146,6 +146,7 @@ def register_named_worker(
     model: str | None = None,
     backend: str = "claude",
     preferred_tier: str | None = None,
+    force_tier: str | None = None,
 ) -> dict:
     """Pre-seed a named worker in the registry.
 
@@ -159,13 +160,13 @@ def register_named_worker(
     reg = _load_registry()
     existing = reg.get(name)
     if existing:
-        # Config fields (cwd / model / backend / preferred_tier) are authoritative
-        # from seed_named_workers — always update them on re-seed so path tweaks
-        # actually propagate. session_id is NEVER overwritten (that would orphan
-        # the live session transcript).
+        # Config fields (cwd / model / backend / preferred_tier / force_tier)
+        # are authoritative from seed_named_workers — always update them on
+        # re-seed so path tweaks actually propagate. session_id is NEVER
+        # overwritten (that would orphan the live session transcript).
         for key, val in (
             ("cwd", cwd), ("model", model), ("backend", backend),
-            ("preferred_tier", preferred_tier),
+            ("preferred_tier", preferred_tier), ("force_tier", force_tier),
         ):
             if val is not None:
                 existing[key] = val
@@ -188,6 +189,7 @@ def register_named_worker(
         "model": model,
         "backend": backend,
         "preferred_tier": preferred_tier,
+        "force_tier": force_tier,  # if set, budget routing cannot downgrade
         "is_canonical": True,
     }
     reg[name] = entry
@@ -221,40 +223,35 @@ def seed_named_workers():
     )
     # General-purpose agents — cwd widened to `C:\Users\Rook` so they can
     # traverse AI\, Documents\Claude\, and Downloads\ without self-restricting.
-    # Combined with the permission preamble this is what unblocks Shadowling's
-    # RCC-side edits to `C:\Users\Rook\AI\raiken\`.
     general_cwd = r"C:\Users\Rook"
+    # Shadowling Commander — DEFAULT for anything that doesn't have a dedicated
+    # specialist. All coding, UI, RCC internals, general heavy work.
     register_named_worker(
         "Shadowling Commander",
         cwd=general_cwd, backend="claude", preferred_tier="opus",
     )
+    # Oracle — information gathering only. Research, web summarization,
+    # "what is X, how does Y work". Not for writing code.
     register_named_worker(
         "Oracle",
         cwd=general_cwd, backend="claude", preferred_tier="opus",
     )
-    for sonnet_agent in ("Ledger", "Herald", "Scribe", "Cipher"):
-        register_named_worker(
-            sonnet_agent, cwd=general_cwd, backend="claude", preferred_tier="sonnet",
-        )
+    # Keeper — memory file upkeep only. Compaction, reorganizing docs/memory/,
+    # keeping pronoun/manifest/other reference files current.
     register_named_worker(
         "Keeper",
         cwd=general_cwd, backend="claude", preferred_tier="haiku",
     )
-    # Raiken Agent — 11th canonical agent, Raiken's own problem-solver half.
-    # Opus max-effort by design. RARELY used: Dispatcher only escalates to her
-    # for genuinely hard problems or after consistent failures from other
-    # agents. Not the default for routine heavy work — that's Shadowling
-    # Commander's job. Raiken Agent runs expensive sub-agent validation on her
-    # answers, so every dispatch costs several workers' worth of tokens.
+    # Raiken Agent — Raiken's own advisor body (Opus, forced tier — never
+    # downgraded by budget). ADVISES other agents; does NOT take over their
+    # tasks. When a worker calls ask-raiken, Raiken Agent returns guidance and
+    # the worker continues. When Rook explicitly asks Raiken himself to handle
+    # something, Dispatcher routes here. Runs with max reasoning effort by
+    # design — every dispatch is expensive, treat him as the senior consultant.
     register_named_worker(
         "Raiken Agent",
         cwd=general_cwd, backend="claude", preferred_tier="opus",
-    )
-    # Pyre — local LLM via Ollama. Backend routing flips this to workers_ollama.
-    register_named_worker(
-        "Pyre",
-        backend="ollama",
-        model="qwen2.5:14b",
+        force_tier="opus",  # budget can't downgrade — always max
     )
 
 
